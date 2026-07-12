@@ -1,79 +1,99 @@
-# RepoPilot：面向真实代码仓库的 Issue Resolution Agent
+English | [中文](README.zh-CN.md)
+
+# RepoPilot: A Repository-Aware Issue Resolution Agent
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-给它一个 git 仓库和一个 issue，它负责走完整条软件工程闭环：
+Give it a git repository and an issue. It runs the full software engineering
+loop end to end:
 
 ```
-Issue → 基线测试 → 修改计划 → 代码定位与编辑 → 测试验证 → 失败重试 → 独立审查 → Git Diff / 报告
+Issue → Baseline Tests → Plan → Locate & Edit Code → Verify → Retry on Failure → Independent Review → Diff / Report
 ```
 
-**手写、无框架。** 没有 LangChain / LangGraph —— agent 循环、工具调度、权限闸门、
-结构化输出、状态机全部裸写。这既是学习方式，也是立场：核心机制必须可理解、可调试。
+**Hand-written, no agent framework.** No LangChain, no LangGraph — the tool-calling
+loop, tool dispatch, permission gate, structured output, and state machine are all
+implemented from scratch on top of the raw OpenAI-compatible SDK. This is both a
+learning choice and a design stance: the core mechanics should be understandable
+and debuggable, not hidden behind an abstraction layer.
 
-## 快速开始
+## Quick Start
 
 ```bash
 pip install -e .
-pip install pytest-cov  # 如果目标仓库的测试依赖它（很多 Python 项目会）
-cp .env.example .env    # 填入 DeepSeek/OpenAI 兼容 key
+pip install pytest-cov  # many Python repos' test suites depend on it
+cp .env.example .env    # fill in a DeepSeek / OpenAI-compatible API key
 
-# 挑一个真实仓库练手：这里克隆 tinydb 做演示，换成任何 git 仓库都行
+# Pick a real repo to try it on — tinydb is used here as a demo, any git repo works
 git clone https://github.com/msiemens/tinydb ../tinydb-demo
 
-repo-pilot detect --repo ../tinydb-demo                                    # 不花钱：看 adapter 识别结果
-repo-pilot solve  --repo ../tinydb-demo --issue-file examples/tinydb_issue.md --plan-only  # 花一次调用：只出计划
-repo-pilot solve  --repo ../tinydb-demo --issue-file examples/tinydb_issue.md              # 完整闭环
+repo-pilot detect --repo ../tinydb-demo                                    # free: check adapter detection
+repo-pilot solve  --repo ../tinydb-demo --issue-file examples/tinydb_issue.md --plan-only  # one call: plan only
+repo-pilot solve  --repo ../tinydb-demo --issue-file examples/tinydb_issue.md              # full loop
 ```
 
-`examples/tinydb_issue.md` 描述的是一个真实可复现的边界值 bug（`<=` 查询漏掉恰好等于
-边界的记录）。想亲眼验证 Verifier 的"基线对比"逻辑，可以先手动在 `../tinydb-demo` 里改坏
-`tinydb/queries.py` 的 `__le__` 方法（把 `<=` 改成 `<`）再运行。
+`examples/tinydb_issue.md` describes a real, reproducible boundary-value bug (a
+`<=` query silently drops records exactly at the boundary). To watch the
+Verifier's baseline-comparison logic actually catch something, break
+`tinydb/queries.py`'s `__le__` method by hand first (change `<=` to `<`) in
+`../tinydb-demo`, then run the command above.
 
-## 架构：模块与文件一一对应
+## Architecture: Modules Map Directly to Files
 
 ```
-Agent Core            orchestrator.py   状态机 BASELINE→PLAN→EXECUTE→VERIFY→REVIEW→REPORT
-                      planner.py        issue → 结构化计划（JSON）
-                      executor.py       工具调用主循环（流式）
-                      reviewer.py       独立上下文复查（看不到 executor 的自我叙事）
-Repository Intel      workspace.py      git 工作区：干净门禁 / diff / 回滚兜底 / 文件清单
-                      adapters.py       唯一认识具体技术栈的地方（Python 深支持，Node 浅探测）
-Tool Runtime          tools.py          read / list / search(ripgrep) / symbols(ast) /
-                                        edit(片段替换) / write / bash / run_tests / git_diff
-Verification          verifier.py       测试基线对比：fixed / regressed / improved / no_change
-Safety                policy.py         路径越狱拦截、危险命令黑名单、.git 写保护
-                      permissions.py    人对每次改动的知情与否决权
-Observability         trace.py          run.jsonl 执行轨迹（评测的原始数据）
-GitHub（外壳）        github.py         gh CLI 抓 issue；PR 创建是 Phase 4
+Agent Core             orchestrator.py   State machine: BASELINE→PLAN→EXECUTE→VERIFY→REVIEW→REPORT
+                        planner.py        issue → structured plan (JSON)
+                        executor.py       Tool-calling main loop (streaming)
+                        reviewer.py       Independent-context review (never sees the executor's own narrative)
+Repository Intel        workspace.py      Git workspace: clean-tree gate / diff / rollback / file listing
+                        adapters.py       The only place that knows about a specific tech stack
+                                          (deep support for Python, shallow detection for Node)
+Tool Runtime            tools.py          read / list / search (ripgrep) / symbols (ast) /
+                                          edit (exact-match replace) / write / bash / run_tests / git_diff
+Verification            verifier.py       Test baseline comparison: fixed / regressed / improved / no_change
+Safety                  policy.py         Path jailing, dangerous-command blocklist, .git write protection
+                        permissions.py    Human visibility and veto over every mutating action
+Observability           trace.py          run.jsonl execution trace (raw data for evaluation)
+GitHub (optional shell) github.py         Fetch issues via gh CLI; PR creation is Phase 4
 ```
 
-## 核心设计决策
+## Core Design Decisions
 
-- **验证是灵魂**：改前跑测试存基线，改后再跑对比。"修好了"是测量结果，不是模型的一句话。
-- **Reviewer 上下文隔离**：审查者只看 issue/计划/diff/测试对比这四样证据，看不到 executor
-  "我改好了"的对话史 —— 自己查自己永远通过，隔离才有真审查。
-- **Adapter 模式**：核心 agent 只问两个问题（什么项目类型？怎么跑测试？）。支持新技术栈
-  = 加一个探测分支，核心零改动。
-- **硬约束优先**：路径锁死仓库内、危险命令黑名单、改动文件数上限、轮数上限、
-  git commit/push 一律封锁 —— 最后一步（commit）永远归人。
-- **全程可观察**：每次状态转移、每个工具调用都进 `runs/<时间戳>/run.jsonl`，
-  评测 = 对这些文件做统计。
+- **Verification is the whole point.** Run the test suite before touching anything to
+  record a baseline, then run it again after. "Fixed" is a measured fact, not a
+  claim the model makes about itself.
+- **The Reviewer is context-isolated.** It only sees the issue, the plan, the diff, and
+  the test comparison — never the executor's own "I fixed it" narrative. An agent
+  reviewing its own conversation history will always approve; isolation is what
+  makes the review real.
+- **Adapter pattern.** The core agent only ever asks two questions: what kind of
+  project is this, and how do I run its tests? Supporting a new stack means adding
+  one detection branch — the core never changes.
+- **Hard constraints over soft ones.** Paths are jailed to the repo root, dangerous
+  commands are blocklisted, there's a cap on files modified per run and on loop
+  turns, and `git commit`/`git push` are blocked outright — the final commit is
+  always a human decision.
+- **Fully observable.** Every state transition and tool call is appended to
+  `runs/<timestamp>/run.jsonl`. Evaluation is just aggregating over these files.
 
-## 路线图
+## Roadmap
 
-- [x] **Phase 0–3（MVP，当前）** 完整闭环：Plan / Execute / Verify(基线对比+重试) /
-      Review(独立上下文) / Trace / Python adapter / 安全策略
-- [ ] **Phase 4 外壳** GitHub issue 直接抓取（已有雏形）、自动建分支与 Draft PR、
-      NestJS adapter 深化（Jest/E2E 识别）
-- [ ] **Phase 5 深水区（一次挖一个）** Docker 沙箱替代黑名单 / ts-morph 符号索引 /
-      依赖图检索 / SWE-bench Lite 批量评测（成功率、token 成本、工具调用数）
+- [x] **Phase 0–3 (MVP, current)** Full loop: Plan / Execute / Verify (baseline
+      comparison + retry) / Review (isolated context) / Trace / Python adapter /
+      safety policy
+- [ ] **Phase 4 (shell)** Direct GitHub issue fetching (prototype exists), automatic
+      branch + draft PR creation, deeper NestJS adapter (Jest/E2E detection)
+- [ ] **Phase 5 (deep end, one at a time)** Docker sandbox in place of the
+      blocklist / ts-morph symbol indexing / dependency-graph retrieval /
+      batch evaluation on SWE-bench Lite (success rate, token cost, tool-call count)
 
-## 背景
+## Background
 
-本项目源自一门"从零手写编程 agent"的自学课程（不依赖任何框架，从裸 API 逐步实现
-工具调用循环、权限闸门、上下文隔离等核心机制）。RepoPilot 是这门课程的毕业设计，
-把学到的机制应用到一个更贴近真实工程场景的任务上：解决真实代码仓库里的 issue。
+This project grew out of a self-directed course on writing a coding agent from
+scratch — no frameworks, building up the tool-calling loop, permission gate, and
+context isolation mechanics one piece at a time from a raw API. RepoPilot is that
+course's capstone project: taking those mechanics and applying them to something
+closer to real engineering work — resolving issues in real code repositories.
 
 ## License
 
