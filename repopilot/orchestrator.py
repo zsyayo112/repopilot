@@ -4,10 +4,15 @@ LangGraph 卖的就是这张图的框架版；手写出来不过几十行 while 
 
     BASELINE → PLAN → EXECUTE → VERIFY ──不达标且有重试额度──→ EXECUTE
                                   │
-                                  └──达标 / 额度耗尽──→ REVIEW → REPORT
+                                  ├──达标 / 额度耗尽──────────→ REVIEW → REPORT → DONE
+                                  └──改动超限（疑似跑偏）──跳过审查──→ REPORT → DONE
 
 状态显式化的价值：每次状态切换都写进 trace，事后能精确回放
 "它在哪个状态花了多少步、为什么转移" —— 这是可观察性的地基。
+
+一条硬规则：DONE 是【唯一】的真·终止态。所有结局——成功、失败、跑偏中止——
+都必须先流经 REPORT 这道唯一出口，把"发生了什么 / diff 是什么 / 要不要回滚"
+讲给用户听。绝不允许"哑巴终止"（把 state 一设、直接 return，什么都不交代）。
 """
 
 import json
@@ -57,9 +62,10 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
     state = "BASELINE"
     attempt = 0
     baseline = plan = messages = comparison = verdict = None
+    abort_reason = None   # 非 None 表示"跑偏中止"，REPORT 据此走另一套输出
     exit_code = 1
 
-    while state not in ("DONE", "FAILED"):
+    while state != "DONE":   # DONE 是唯一真·终止态，一切结局都得先过 REPORT
         trace.event("state", state=state, attempt=attempt)
 
         if state == "BASELINE":
@@ -95,13 +101,17 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
             trace.event("verify", **comparison)
             print(f"{DIM}状态：{comparison['status']}\n{after.summary()}{RESET}")
 
-            # 硬约束：改动规模超限直接判负（防"改跑偏"洗掉半个仓库）
+            # 硬约束：改动规模超限判为跑偏。不送 REVIEW（对一堆乱改跑审查既费钱
+            # 又无意义），但【仍要经过 REPORT】——把 diff 和回滚命令交给用户，
+            # 撤不撤由人决定（"最后一步永远归人"）。
             modified = ws.modified_files()
             if len(modified) > MAX_MODIFIED_FILES:
                 print(f"{RED}[中止] 改动了 {len(modified)} 个文件，超过上限 "
                       f"{MAX_MODIFIED_FILES}：{modified}{RESET}")
                 trace.event("abort", reason="modified_files_exceeded", files=modified)
-                state = "FAILED"
+                abort_reason = (f"改动了 {len(modified)} 个文件，超过上限 "
+                                f"{MAX_MODIFIED_FILES}，疑似跑偏，已跳过审查。")
+                state = "REPORT"
             elif comparison["status"] in ("fixed", "still_green"):
                 state = "REVIEW"
             elif attempt < max_attempts:
@@ -125,20 +135,27 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
             state = "REPORT"
 
         elif state == "REPORT":
-            ok = comparison["status"] in ("fixed", "still_green") \
-                and verdict.get("verdict") == "approve"
+            # 两种入口：正常收尾（经过 REVIEW，有 verdict）或跑偏中止（无 verdict）。
+            # 中止一律判负，且不引用 verdict（它是 None）。
+            aborted = abort_reason is not None
+            ok = (not aborted
+                  and comparison["status"] in ("fixed", "still_green")
+                  and verdict.get("verdict") == "approve")
             exit_code = 0 if ok else 1
             color = GREEN if ok else RED
 
             print(f"\n{BOLD}{'=' * 60}{RESET}")
             print(f"{BOLD}RepoPilot 报告{RESET}")
+            if aborted:
+                print(f"  {RED}中止：{abort_reason}{RESET}")
             print(f"  测试对比：{comparison['status']}")
-            print(f"  审查结论：{color}{verdict.get('verdict')}{RESET} —— "
-                  f"{verdict.get('comments', '')}")
-            if verdict.get("unrelated_changes"):
-                print(f"  {YELLOW}无关改动：{verdict['unrelated_changes']}{RESET}")
-            if verdict.get("missing_tests"):
-                print(f"  {YELLOW}缺少防复发测试{RESET}")
+            if not aborted:
+                print(f"  审查结论：{color}{verdict.get('verdict')}{RESET} —— "
+                      f"{verdict.get('comments', '')}")
+                if verdict.get("unrelated_changes"):
+                    print(f"  {YELLOW}无关改动：{verdict['unrelated_changes']}{RESET}")
+                if verdict.get("missing_tests"):
+                    print(f"  {YELLOW}缺少防复发测试{RESET}")
             print(f"\n{ws.diff_stat() or '(无改动)'}")
             print(f"\n{DIM}完整轨迹：{run_dir}/")
             print(f"满意 → 自己去 commit（agent 被策略禁止 commit，最后一步永远归人）：")
@@ -146,7 +163,8 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
             print(f"不满意 → 一键回滚：")
             print(f"    cd {ws.root} && git checkout -- . && git clean -fd{RESET}")
             trace.event("report", ok=ok, status=comparison["status"],
-                        verdict=verdict.get("verdict"))
+                        verdict=(None if aborted else verdict.get("verdict")),
+                        aborted=aborted)
             state = "DONE"
 
     trace.event("end", exit_code=exit_code)
