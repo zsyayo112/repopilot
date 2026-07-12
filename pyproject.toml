@@ -1,17 +1,37 @@
 [project]
 name = "repopilot"
 version = "0.1.0"
-description = "Repository-aware issue resolution agent —— 手写、无框架"
+description = "Repository-aware issue resolution agent — hand-written, no framework"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [{ name = "zsyayo112" }]
+keywords = [
+    "ai-agent", "coding-agent", "llm", "issue-resolution",
+    "swe-agent", "deepseek", "tool-calling",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+]
 dependencies = [
     "openai>=1.0",
     "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/zsyayo112/repopilot"
+Repository = "https://github.com/zsyayo112/repopilot"
+Issues = "https://github.com/zsyayo112/repopilot/issues"
 
 [project.scripts]
 repo-pilot = "repopilot.cli:main"
@@ -22,3 +42,15 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["repopilot*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E501（行长）：双语注释天然偏长，强拆反而伤可读性，这里不作硬性要求
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

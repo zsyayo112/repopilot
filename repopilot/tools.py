@@ -14,15 +14,14 @@
 """
 
 import ast
-import re
 import shutil
 import subprocess
 
+from . import verifier
 from .adapters import RepoProfile
 from .config import CMD_TIMEOUT, MAX_TOOL_OUTPUT
 from .policy import check_command, jail
 from .workspace import Workspace
-from . import verifier
 
 
 class ToolKit:

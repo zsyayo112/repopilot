@@ -17,6 +17,7 @@ from .config import CMD_TIMEOUT
 
 @dataclass
 class TestReport:
+    __test__ = False  # 类名以 Test 开头，明确告诉 pytest 别把它当测试类收集
     exit_code: int
     passed: int
     failed: int

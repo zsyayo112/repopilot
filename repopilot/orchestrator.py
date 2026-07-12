@@ -20,8 +20,16 @@ import time
 
 from .adapters import detect
 from .config import (
-    BOLD, CLONES_DIR, DIM, GREEN, MAX_FIX_ATTEMPTS, MAX_MODIFIED_FILES,
-    RED, RESET, RUNS_DIR, YELLOW,
+    BOLD,
+    CLONES_DIR,
+    DIM,
+    GREEN,
+    MAX_FIX_ATTEMPTS,
+    MAX_MODIFIED_FILES,
+    RED,
+    RESET,
+    RUNS_DIR,
+    YELLOW,
 )
 from .executor import build_initial_messages, run_executor
 from .permissions import Permissions
@@ -158,9 +166,9 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
                     print(f"  {YELLOW}缺少防复发测试{RESET}")
             print(f"\n{ws.diff_stat() or '(无改动)'}")
             print(f"\n{DIM}完整轨迹：{run_dir}/")
-            print(f"满意 → 自己去 commit（agent 被策略禁止 commit，最后一步永远归人）：")
+            print("满意 → 自己去 commit（agent 被策略禁止 commit，最后一步永远归人）：")
             print(f"    cd {ws.root} && git add -p && git commit")
-            print(f"不满意 → 一键回滚：")
+            print("不满意 → 一键回滚：")
             print(f"    cd {ws.root} && git checkout -- . && git clean -fd{RESET}")
             trace.event("report", ok=ok, status=comparison["status"],
                         verdict=(None if aborted else verdict.get("verdict")),

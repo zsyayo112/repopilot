@@ -1,6 +1,10 @@
 """集中配置：模型客户端、预算与硬约束。配置只有一处来源（沿用 agent/config.py 的原则）。
 
 .env 查找顺序：repopilot 项目根 → 上一级目录（学习期直接复用 study_agent 的 key）。
+
+【为什么 client 是懒加载的】导入本模块不该有副作用、更不该要求 API key：
+单元测试、CI、以及 `repo-pilot detect`（纯静态探测，根本不调模型）都必须能在
+没有 key 的环境里跑起来。所以 key 只在【真正要发起模型调用时】才检查——见 get_client()。
 """
 
 import os
@@ -18,11 +22,26 @@ for _candidate in (PROJECT_ROOT / ".env", PROJECT_ROOT.parent / ".env"):
 else:
     load_dotenv()
 
-client = OpenAI(
-    api_key=os.environ["OPENAI_API_KEY"],
-    base_url=os.environ["OPENAI_BASE_URL"],
-)
-MODEL = os.environ["OPENAI_MODEL"]
+MODEL = os.environ.get("OPENAI_MODEL", "deepseek-chat")
+
+_client: OpenAI | None = None
+
+
+def get_client() -> OpenAI:
+    """懒加载单例。第一次真正要调模型时才构造，也才要求 key 存在。"""
+    global _client
+    if _client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "未设置 OPENAI_API_KEY。请在项目根执行 `cp .env.example .env` 并填入你的 key。"
+            )
+        _client = OpenAI(
+            api_key=api_key,
+            base_url=os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com"),
+        )
+    return _client
+
 
 # ---------------------------------------------------------------------------
 # 预算与硬约束。数字偏保守，跑通后再放宽。

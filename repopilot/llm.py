@@ -11,7 +11,7 @@ Planner 和 Reviewer 都靠这一个函数。
 import json
 import re
 
-from .config import MODEL, client
+from .config import MODEL, get_client
 
 
 def json_call(system: str, user: str, retries: int = 2) -> dict:
@@ -24,6 +24,7 @@ def json_call(system: str, user: str, retries: int = 2) -> dict:
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    client = get_client()
     last_err = ""
     for _ in range(retries + 1):
         try:

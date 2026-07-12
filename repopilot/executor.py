@@ -11,7 +11,7 @@
 
 import json
 
-from .config import BOLD, CYAN, DIM, MAX_TURNS, MODEL, RED, RESET, YELLOW, client
+from .config import BOLD, CYAN, DIM, MAX_TURNS, MODEL, RED, RESET, YELLOW, get_client
 from .permissions import Permissions
 from .tools import SAFE_TOOLS, TOOLS, ToolKit
 from .trace import Trace
@@ -31,7 +31,7 @@ EXECUTOR_SYSTEM = """你是一个在真实 git 仓库里解决 issue 的编程 a
 
 def _stream_once(messages: list) -> tuple[str, list, int]:
     """一次流式请求：边收边打印文本，拼装 tool_calls 碎片。原样继承 agent/loop.py。"""
-    stream = client.chat.completions.create(
+    stream = get_client().chat.completions.create(
         model=MODEL, messages=messages, tools=TOOLS,
         stream=True, stream_options={"include_usage": True},
     )

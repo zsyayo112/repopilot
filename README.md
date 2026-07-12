@@ -2,7 +2,9 @@ English | [中文](README.zh-CN.md)
 
 # RepoPilot: A Repository-Aware Issue Resolution Agent
 
+[![CI](https://github.com/zsyayo112/repopilot/actions/workflows/ci.yml/badge.svg)](https://github.com/zsyayo112/repopilot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org)
 
 Give it a git repository and an issue. It runs the full software engineering
 loop end to end:
@@ -47,7 +49,7 @@ Agent Core             orchestrator.py   State machine: BASELINE→PLAN→EXECUT
                         reviewer.py       Independent-context review (never sees the executor's own narrative)
 Repository Intel        workspace.py      Git workspace: clean-tree gate / diff / rollback / file listing
                         adapters.py       The only place that knows about a specific tech stack
-                                          (deep support for Python, shallow detection for Node)
+                                          (registry of per-stack detectors; see table below)
 Tool Runtime            tools.py          read / list / search (ripgrep) / symbols (ast) /
                                           edit (exact-match replace) / write / bash / run_tests / git_diff
 Verification            verifier.py       Test baseline comparison: fixed / regressed / improved / no_change
@@ -56,6 +58,26 @@ Safety                  policy.py         Path jailing, dangerous-command blockl
 Observability           trace.py          run.jsonl execution trace (raw data for evaluation)
 GitHub (optional shell) github.py         Fetch issues via gh CLI; PR creation is Phase 4
 ```
+
+## Supported Stacks
+
+The core agent is framework-agnostic; all tech-stack knowledge lives in
+[`adapters.py`](repopilot/adapters.py). Detection is a registry of small
+detector functions — adding a stack is one function plus one test, with **zero
+changes to the core**. Anything unrecognized still works via `--test-cmd`.
+
+| Stack | Detected by | Test command |
+|-------|-------------|--------------|
+| Python | `pyproject.toml` / `setup.py` / `pytest.ini` / … | `pytest` |
+| Rust | `Cargo.toml` | `cargo test` |
+| Go | `go.mod` | `go test ./...` |
+| Java (Maven) | `pom.xml` | `mvn -q -B test` |
+| Java (Gradle) | `build.gradle[.kts]` | `./gradlew test` (or `gradle test`) |
+| Ruby | `.rspec` / `spec/` / `Gemfile` | `bundle exec rspec` / `rake test` |
+| Node | `package.json` | `npm test` |
+| NestJS | `package.json` with `@nestjs/core` | `npm test` |
+| _(fallback)_ | `Makefile` with a `test:` target | `make test` |
+| _anything_ | `--test-cmd "<cmd>"` | your command |
 
 ## Core Design Decisions
 
@@ -79,13 +101,24 @@ GitHub (optional shell) github.py         Fetch issues via gh CLI; PR creation i
 ## Roadmap
 
 - [x] **Phase 0–3 (MVP, current)** Full loop: Plan / Execute / Verify (baseline
-      comparison + retry) / Review (isolated context) / Trace / Python adapter /
-      safety policy
+      comparison + retry) / Review (isolated context) / Trace / multi-stack
+      adapters / safety policy / CI + lint
 - [ ] **Phase 4 (shell)** Direct GitHub issue fetching (prototype exists), automatic
       branch + draft PR creation, deeper NestJS adapter (Jest/E2E detection)
 - [ ] **Phase 5 (deep end, one at a time)** Docker sandbox in place of the
       blocklist / ts-morph symbol indexing / dependency-graph retrieval /
       batch evaluation on SWE-bench Lite (success rate, token cost, tool-call count)
+
+## Development
+
+```bash
+pip install -e ".[dev]"   # installs pytest + ruff
+pytest -q                 # run tests (offline — no API key needed)
+ruff check .              # lint
+```
+
+CI runs lint + tests across Python 3.10–3.12 on every push and PR. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to add a new Repository Adapter.
 
 ## Background
 
