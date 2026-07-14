@@ -212,6 +212,12 @@ def solve(inst: dict, wd: Path, res: dict) -> bool:
     if code == -1:
         res.update(stage="solve_error", error="solve 超时")
         return False
+    # 程序崩溃（如 API 503 炸穿）≠ 认真尝试后失败，标成 solve_error 以便重跑，
+    # 不混进 scored 的分母里假装"尝试过"
+    if "Traceback (most recent call last)" in out:
+        last = clean.strip().splitlines()[-1] if clean.strip() else ""
+        res.update(stage="solve_error", error=f"solve 崩溃：{last[:200]}")
+        return False
     return True
 
 

@@ -11,7 +11,8 @@
 
 import json
 
-from .config import BOLD, CYAN, DIM, MAX_TURNS, MODEL, RED, RESET, YELLOW, get_client
+from .config import BOLD, CYAN, DIM, MAX_TURNS, MODEL, RED, RESET, YELLOW
+from .llm import create_with_retry
 from .permissions import Permissions
 from .tools import SAFE_TOOLS, TOOLS, ToolKit
 from .trace import Trace
@@ -31,7 +32,9 @@ EXECUTOR_SYSTEM = """你是一个在真实 git 仓库里解决 issue 的编程 a
 
 def _stream_once(messages: list) -> tuple[str, list, int]:
     """一次流式请求：边收边打印文本，拼装 tool_calls 碎片。原样继承 agent/loop.py。"""
-    stream = get_client().chat.completions.create(
+    # create_with_retry：503 过载/限流/超时自动退避重试（见 llm.py 顶部说明）。
+    # 只保护"发起请求"这一步；流已经开始后中断的情况极少，MVP 不做续流。
+    stream = create_with_retry(
         model=MODEL, messages=messages, tools=TOOLS,
         stream=True, stream_options={"include_usage": True},
     )
