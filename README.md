@@ -105,9 +105,15 @@ changes to the core**. Anything unrecognized still works via `--test-cmd`.
       adapters / safety policy / CI + lint
 - [ ] **Phase 4 (shell)** Direct GitHub issue fetching (prototype exists), automatic
       branch + draft PR creation, deeper NestJS adapter (Jest/E2E detection)
+- [x] **SWE-bench Lite mini-evaluation** — 2/8 resolved (25%) on pure-Python
+      instances in a lightweight local setting (venv per instance, tests scoped
+      to the official test files; the full harness uses Docker). Scoring matches
+      the official protocol: revert test files, apply the official test patch,
+      require all FAIL_TO_PASS + PASS_TO_PASS. See [`eval/`](eval/) and
+      [`eval/RESULTS.md`](eval/RESULTS.md).
 - [ ] **Phase 5 (deep end, one at a time)** Docker sandbox in place of the
       blocklist / ts-morph symbol indexing / dependency-graph retrieval /
-      batch evaluation on SWE-bench Lite (success rate, token cost, tool-call count)
+      full SWE-bench Lite sweep in the official Docker harness
 
 ## Development
 
