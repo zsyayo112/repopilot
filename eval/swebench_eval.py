@@ -190,6 +190,12 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 def solve(inst: dict, wd: Path, res: dict) -> bool:
     """调 RepoPilot 修 issue。--yes 免确认（无头评测），stdout 存 solve.log。"""
     log("  RepoPilot solve …（几分钟，取决于模型）")
+    repo_dir = wd / "repo"
+    # 先把工作区还原成 pristine：上一轮失败的 solve、或判分阶段打上的官方
+    # test_patch 都会留下残余改动，而 RepoPilot 的干净门禁会拒绝在脏工作区上
+    # 启动（实测踩坑：重跑批次全被自己的判分残留拦下）。幂等重跑 = 先复位。
+    sh(["git", "checkout", "--", "."], cwd=repo_dir)
+    sh(["git", "clean", "-fdq"], cwd=repo_dir)
     t0 = time.time()
     code, out = sh(
         [sys.executable, "-m", "repopilot", "solve",
@@ -212,11 +218,13 @@ def solve(inst: dict, wd: Path, res: dict) -> bool:
     if code == -1:
         res.update(stage="solve_error", error="solve 超时")
         return False
-    # 程序崩溃（如 API 503 炸穿）≠ 认真尝试后失败，标成 solve_error 以便重跑，
-    # 不混进 scored 的分母里假装"尝试过"
-    if "Traceback (most recent call last)" in out:
+    # 完成与否的可靠判据：RepoPilot 的状态机保证一切正常结局必经 REPORT
+    # （DONE 是唯一终止态）。输出里没有报告横幅 = 崩溃或被门禁拒绝。
+    # 【不能】用 "Traceback" in out 判崩溃：agent 调试时会故意打印 bug 的
+    # traceback，会被误杀（B 路 3 条实测被误杀，全是完成了的真实尝试）。
+    if "RepoPilot 报告" not in clean:
         last = clean.strip().splitlines()[-1] if clean.strip() else ""
-        res.update(stage="solve_error", error=f"solve 崩溃：{last[:200]}")
+        res.update(stage="solve_error", error=f"solve 未走到 REPORT：{last[:200]}")
         return False
     return True
 
