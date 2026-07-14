@@ -7,3 +7,6 @@ runs/
 *.pyc
 dist/
 build/
+eval/work/
+eval/cache/
+eval/instances.json
