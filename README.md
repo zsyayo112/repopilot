@@ -105,11 +105,14 @@ changes to the core**. Anything unrecognized still works via `--test-cmd`.
       adapters / safety policy / CI + lint
 - [ ] **Phase 4 (shell)** Direct GitHub issue fetching (prototype exists), automatic
       branch + draft PR creation, deeper NestJS adapter (Jest/E2E detection)
-- [x] **SWE-bench Lite mini-evaluation** — 2/8 resolved (25%) on pure-Python
-      instances in a lightweight local setting (venv per instance, tests scoped
-      to the official test files; the full harness uses Docker). Scoring matches
-      the official protocol: revert test files, apply the official test patch,
-      require all FAIL_TO_PASS + PASS_TO_PASS. See [`eval/`](eval/) and
+- [x] **SWE-bench Lite mini-evaluation** — on 8 attempted pure-Python instances
+      in a lightweight local setting: **3/3 resolved on instances our environment
+      could certify** (gold-patch calibration: the official fix itself must pass
+      locally, else the instance is an environment artifact — Python 3.12 kills
+      several 2022-era test suites), 3/8 under the conservative reading. Scoring
+      re-implements the official protocol (revert test files → apply official
+      test patch → all FAIL_TO_PASS + PASS_TO_PASS), including its
+      whitespace-truncated test-ID matching. See [`eval/`](eval/) and
       [`eval/RESULTS.md`](eval/RESULTS.md).
 - [ ] **Phase 5 (deep end, one at a time)** Docker sandbox in place of the
       blocklist / ts-morph symbol indexing / dependency-graph retrieval /

@@ -229,14 +229,37 @@ def solve(inst: dict, wd: Path, res: dict) -> bool:
     return True
 
 
-def run_pytest_ids(venv_py: str, repo_dir: Path, ids: list, chunk=25):
-    """按官方 node id 跑测试，分块防命令行过长。任何一块非 0 即失败。"""
-    for i in range(0, len(ids), chunk):
-        code, out = sh([venv_py, "-m", "pytest", "-q", "--color=no",
-                        *ids[i:i + chunk]], cwd=repo_dir, timeout=900)
-        if code != 0:
-            return False, out[-500:]
-    return True, ""
+_STATUS_LINE = re.compile(r"^(PASSED|FAILED|ERROR|XFAIL|XPASS|SKIPPED)\s+(\S+)")
+
+
+def grade(venv_py: str, repo_dir: Path, f2p: list, p2p: list):
+    """官方同款判分。关键：【不能】按 node id 逐个选测试——
+    数据集的 F2P/P2P id 是当年按空格切 pytest 输出生成的，参数含空格的 id
+    被截成了碎片（如 'test_locate_app[cliapp.factory-'），拿去选测试必然
+    no-name 报错（flask-5063 实测踩坑）。官方判分是：跑整个测试文件，
+    用同样的"空格截断"规则解析 -rA 摘要得到 id→状态表，再逐个比对——
+    两边截断方式一致，碎片 id 也能精确对上。
+
+    返回 (f2p_ok, p2p_ok, 失败样本note)。
+    """
+    files = sorted({i.split("::")[0] for i in (f2p + p2p)})
+    _, out = sh([venv_py, "-m", "pytest", "-rA", "--color=no", *files],
+                cwd=repo_dir, timeout=1200)
+
+    status: dict[str, str] = {}
+    for line in out.splitlines():
+        m = _STATUS_LINE.match(line.strip())
+        if m:
+            status[m.group(2)] = m.group(1)   # 同款截断：\S+ 到第一个空格为止
+
+    # 两套语义：F2P 是"必须修好"——必须白纸黑字 PASSED；
+    # P2P 是"不许退步"——只有显式 FAILED/ERROR 才算坏，SKIPPED/未收集不算
+    # （本环境跑不了的测试，agent 和 gold 一视同仁地忽略，对比仍然公平；
+    #  pytest 的 SKIPPED 摘要行不带完整 id，本来也解析不到）。
+    f2p_bad = [i for i in f2p if status.get(i) not in ("PASSED", "XPASS")]
+    p2p_bad = [i for i in p2p if status.get(i) in ("FAILED", "ERROR")]
+    note = " | ".join(f"{i}→{status.get(i, '未收集')}" for i in (f2p_bad + p2p_bad)[:3])
+    return not f2p_bad, not p2p_bad, note
 
 
 def score(inst: dict, wd: Path, res: dict) -> None:
@@ -267,14 +290,9 @@ def score(inst: dict, wd: Path, res: dict) -> None:
     p2p = json.loads(inst["PASS_TO_PASS"])
     log(f"  判分：FAIL_TO_PASS {len(f2p)} 条 + PASS_TO_PASS {len(p2p)} 条 …")
 
-    f2p_ok, f2p_err = run_pytest_ids(venv_py, repo_dir, f2p)
-    p2p_ok, p2p_err = (True, "")
-    if f2p_ok:                       # F2P 都没过就不必花时间跑 P2P 了
-        p2p_ok, p2p_err = run_pytest_ids(venv_py, repo_dir, p2p)
-
+    f2p_ok, p2p_ok, note = grade(venv_py, repo_dir, f2p, p2p)
     res.update(stage="scored", resolved=bool(f2p_ok and p2p_ok),
-               f2p_ok=f2p_ok, p2p_ok=p2p_ok,
-               score_note=(f2p_err or p2p_err)[-300:])
+               f2p_ok=f2p_ok, p2p_ok=p2p_ok, score_note=note[:300])
 
 
 def cmd_run(args):
@@ -325,6 +343,55 @@ def cmd_run(args):
 
 
 # ---------------------------------------------------------------------------
+# calibrate：判分公平性校准。回答"你自己复刻判分逻辑，怎么知道判得公平？"——
+# 拿官方 gold patch（标准答案）在【我们的环境】里跑同一套判分：
+#   gold 都过不了的实例 = 环境伪影（deps 版本等背锅），从分母剔除；
+#   gold 能过的实例 = 判分器在该实例上可信，agent 的失败是真失败。
+# gold patch 只在这里、判分侧使用，从头到尾不会进入 agent 的视野。
+# ---------------------------------------------------------------------------
+def cmd_calibrate(args):
+    import pyarrow.parquet as pq
+    golds = {r["instance_id"]: r["patch"]
+             for r in pq.read_table(CACHE / "swebench_lite_test.parquet").to_pylist()}
+    instances = {i["instance_id"]: i for i in json.loads(INSTANCES.read_text())}
+
+    for wd in sorted(WORK.iterdir()):
+        res = load_result(wd)
+        if res.get("stage") != "scored":
+            continue
+        iid = wd.name
+        inst, repo_dir = instances[iid], wd / "repo"
+        venv_py = str(wd / "venv" / "bin" / "python")
+        log(f"=== {iid} gold 校准 ===")
+
+        # 复位 → 打 gold → 打 test_patch → 跑官方判分
+        sh(["git", "checkout", "--", "."], cwd=repo_dir)
+        sh(["git", "clean", "-fdq"], cwd=repo_dir)
+        (wd / "gold.patch").write_text(golds[iid], encoding="utf-8")
+        code, out = sh(["git", "apply", "--whitespace=nowarn",
+                        str(wd / "gold.patch")], cwd=repo_dir)
+        if code != 0:
+            res.update(gold_ok=False, gold_note=f"gold 打不上: {out[-200:]}")
+        else:
+            (wd / "test.patch").write_text(inst["test_patch"], encoding="utf-8")
+            sh(["git", "apply", "--whitespace=nowarn",
+                str(wd / "test.patch")], cwd=repo_dir)
+            f2p = json.loads(inst["FAIL_TO_PASS"])
+            p2p = json.loads(inst["PASS_TO_PASS"])
+            ok1, ok2, note = grade(venv_py, repo_dir, f2p, p2p)
+            res.update(gold_ok=bool(ok1 and ok2), gold_note=note[:200])
+
+        # 恢复 agent 的现场：复位 + 重放它当时的 diff
+        sh(["git", "checkout", "--", "."], cwd=repo_dir)
+        sh(["git", "clean", "-fdq"], cwd=repo_dir)
+        if (wd / "agent.diff").exists() and (wd / "agent.diff").read_text().strip():
+            sh(["git", "apply", "--whitespace=nowarn",
+                str(wd / "agent.diff")], cwd=repo_dir)
+        save_result(wd, res)
+        log(f"  gold_ok = {res['gold_ok']}")
+
+
+# ---------------------------------------------------------------------------
 # report：汇总所有 result.json（+ 各自 run.jsonl 的工具/token 统计）
 # ---------------------------------------------------------------------------
 def trace_stats(run_dir):
@@ -351,19 +418,31 @@ def cmd_report(args):
         stats = trace_stats(res.get("run_dir"))
         rows.append({"id": wd.name, **res, **stats})
 
+    # gold 校准把"尝试过"的实例分成两拨：
+    #   certified：gold 在本环境能过 → 判分器对该实例可信，agent 的成败是真成败
+    #   artifact ：gold 都过不了 → 本环境无法判定（如 py3.12 弃用警告杀老代码）
+    artifacts = [r for r in rows
+                 if r["stage"] == "scored" and r.get("gold_ok") is False]
     attempted = [r for r in rows if r["stage"] in ("scored", "solve_error")]
-    resolved = [r for r in attempted if r.get("resolved")]
+    certified = [r for r in attempted if r not in artifacts]
+    resolved = [r for r in certified if r.get("resolved")]
     skipped = [r for r in rows if r["stage"] == "env_error"]
+    calibrated = any("gold_ok" in r for r in rows)
 
     lines = ["# SWE-bench Lite 迷你评测结果", "",
-             f"- 尝试：{len(attempted)}  |  resolved：{len(resolved)}  |  "
+             f"- 尝试：{len(attempted)}  |  gold 校准可判定：{len(certified)}  |  "
+             f"环境伪影（gold 也过不了）：{len(artifacts)}  |  "
              f"环境闸门跳过：{len(skipped)}",
-             f"- **resolved 率 = {len(resolved)}/{len(attempted)}"
-             f"{'' if not attempted else f' = {len(resolved)/len(attempted):.0%}'}**",
+             f"- **可判定实例上 resolved = {len(resolved)}/{len(certified)}"
+             f"{'' if not certified else f' = {len(resolved)/len(certified):.0%}'}**"
+             f"；保守口径（未判定全算失败）= {len(resolved)}/{len(attempted)}"
+             + ("" if calibrated else
+                "（未做 gold 校准，跑 calibrate 子命令可校准判分公平性）"),
              "", "| 实例 | 结果 | 工具调用 | 上下文峰值 | 耗时(s) | 备注 |",
              "|---|---|---|---|---|---|"]
     for r in rows:
-        mark = ("✅ resolved" if r.get("resolved") else
+        mark = ("⚠ env_artifact" if r in artifacts else
+                "✅ resolved" if r.get("resolved") else
                 "⏭ env_skip" if r["stage"] == "env_error" else "❌ " + r["stage"])
         lines.append(f"| {r['id']} | {mark} | {r.get('tools', '')} | "
                      f"{r.get('peak_tokens', '')} | {r.get('solve_secs', '')} | "
@@ -386,8 +465,10 @@ def main():
     r.add_argument("--rescore", action="store_true",
                    help="对已 scored 的实例只重跑判分（不重新花钱 solve）")
     sub.add_parser("report")
+    sub.add_parser("calibrate")
     args = p.parse_args()
-    {"fetch": cmd_fetch, "run": cmd_run, "report": cmd_report}[args.cmd](args)
+    {"fetch": cmd_fetch, "run": cmd_run, "report": cmd_report,
+     "calibrate": cmd_calibrate}[args.cmd](args)
 
 
 if __name__ == "__main__":

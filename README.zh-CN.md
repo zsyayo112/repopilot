@@ -89,10 +89,12 @@ GitHub（外壳）        github.py         gh CLI 抓 issue；PR 创建是 Phas
       Review(独立上下文) / Trace / 多技术栈 adapter / 安全策略 / CI + lint
 - [ ] **Phase 4 外壳** GitHub issue 直接抓取（已有雏形）、自动建分支与 Draft PR、
       NestJS adapter 深化（Jest/E2E 识别）
-- [x] **SWE-bench Lite 迷你评测** — 纯 Python 实例上 2/8 resolved（25%），
-      轻量本地设定（逐实例 venv、测试 scoped 到官方测试文件；官方全套用 Docker）。
-      判分与官方协议一致：还原测试文件 → 打官方 test_patch → FAIL_TO_PASS +
-      PASS_TO_PASS 全过。见 [`eval/`](eval/) 与 [`eval/RESULTS.md`](eval/RESULTS.md)。
+- [x] **SWE-bench Lite 迷你评测** — 轻量本地设定下尝试 8 条纯 Python 实例：
+      **可判定实例上 3/3 resolved**（gold 校准：官方标准答案必须能在本地通过，
+      否则判为环境伪影——Python 3.12 杀死了多个 2022 时代的测试套件），
+      保守口径 3/8。判分复刻官方协议（还原测试文件 → 打官方 test_patch →
+      FAIL_TO_PASS + PASS_TO_PASS 全过），含官方的空格截断 ID 匹配规则。
+      见 [`eval/`](eval/) 与 [`eval/RESULTS.md`](eval/RESULTS.md)。
 - [ ] **Phase 5 深水区（一次挖一个）** Docker 沙箱替代黑名单 / ts-morph 符号索引 /
       依赖图检索 / 官方 Docker 线束下跑完整 SWE-bench Lite
 
