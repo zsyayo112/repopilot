@@ -27,6 +27,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.4"]
+# 浏览器验证是【可选】能力：不装照样能跑全部原有功能，只是 browser_* 工具不暴露。
+# 这条边界是刻意的 —— 核心运行时依赖仍然只有 openai + python-dotenv。
+browser = ["playwright>=1.40"]
 
 [project.urls]
 Homepage = "https://github.com/zsyayo112/repopilot"

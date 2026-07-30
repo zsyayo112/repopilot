@@ -14,7 +14,7 @@ import json
 from .config import BOLD, CYAN, DIM, MAX_TURNS, MODEL, RED, RESET, YELLOW
 from .llm import create_with_retry
 from .permissions import Permissions
-from .tools import SAFE_TOOLS, TOOLS, ToolKit
+from .tools import ToolKit, is_safe
 from .trace import Trace
 
 EXECUTOR_SYSTEM = """你是一个在真实 git 仓库里解决 issue 的编程 agent。当前工作目录就是仓库根目录。
@@ -22,20 +22,50 @@ EXECUTOR_SYSTEM = """你是一个在真实 git 仓库里解决 issue 的编程 a
 工作方法：
 - 给你的计划只是假设：动手改之前，必须先用 search_code / read_file 核实它是否成立。
 - 大文件先 list_symbols 看骨架，再用 read_file 的行号范围分段读，不要整读。
+- 要翻很多文件才能定位时，用 explore 派子 agent 去查（它读的文件不占你的上下文）。
 - 修改一律用 edit_file（精确片段替换）；只有创建全新文件才用 write_file。
 - 每次实质修改后立刻 run_tests 验证；失败就读输出、分析、修正、再跑。
 - 跑测试只用 run_tests 工具，不要用 run_bash 自己拼测试命令。
+- 测试莫名失败（比如报模块找不到）时，先 check_environment —— 环境问题你改代码修不好。
 - 严禁改动与 issue 无关的文件；严禁 cd；所有路径相对仓库根目录。
-- 测试全部通过后：用 git_diff 自查改动是否最小、有无误伤，然后停止调用工具，
-  用一段话总结：改了什么、为什么、测试结果如何。"""
+- 收尾前跑一次 run_validation：测试绿不代表 lint/类型检查/构建也绿。
+- 最后用 git_diff 自查改动是否最小、有无误伤，然后停止调用工具，
+  用一段话总结：改了什么、为什么、测试和验证结果如何。"""
+
+# 只有开了 runtime/browser 能力时才把这段拼进 system prompt。
+# 不开的时候连提都不提 —— 免得模型去想它根本没有的工具。
+RUNTIME_SYSTEM = """
+这个任务开启了【运行时验证】能力，用来处理"必须页面真的渲染出来才能发现"的问题
+（按钮点不动、跳转错误、接口成功但页面没更新、移动端错位、元素被遮挡）。
+
+运行时工作方法：
+- 先 start_services 把应用起起来（它会等到健康检查真正通过才返回）。
+- 有 E2E 套件就先 run_e2e，比自己开浏览器点省事得多。
+- 用 browser_open / browser_snapshot 观察页面，用快照里的 ref 去 click / fill。
+  不要写 CSS 选择器 —— ref 和 role+name 才稳。
+- 页面行为不对时先看 browser_errors 和 read_service_logs，别靠猜。
+- 判断功能是否修好，用 URL / DOM / 网络 / 控制台断言，不要靠截图；
+  截图只用来看视觉问题（错位、遮挡、响应式）。
+- 复现步骤请固化成 run_scenario 的 JSON：修改前跑一次（应该失败），
+  改完跑【同一份】再跑一次（应该通过）。这是"真修好了"的唯一客观证据。"""
 
 
-def _stream_once(messages: list) -> tuple[str, list, int]:
-    """一次流式请求：边收边打印文本，拼装 tool_calls 碎片。原样继承 agent/loop.py。"""
+def system_prompt(groups: tuple[str, ...]) -> str:
+    if "runtime" in groups or "browser" in groups:
+        return EXECUTOR_SYSTEM + "\n" + RUNTIME_SYSTEM
+    return EXECUTOR_SYSTEM
+
+
+def _stream_once(messages: list, tools: list) -> tuple[str, list, int]:
+    """一次流式请求：边收边打印文本，拼装 tool_calls 碎片。原样继承 agent/loop.py。
+
+    tools 现在由调用方传入（来自 toolkit.specs()）而不是写死的全局 TOOLS ——
+    因为工具按能力分组暴露，不同任务拿到的工具列表不一样。
+    """
     # create_with_retry：503 过载/限流/超时自动退避重试（见 llm.py 顶部说明）。
     # 只保护"发起请求"这一步；流已经开始后中断的情况极少，MVP 不做续流。
     stream = create_with_retry(
-        model=MODEL, messages=messages, tools=TOOLS,
+        model=MODEL, messages=messages, tools=tools,
         stream=True, stream_options={"include_usage": True},
     )
 
@@ -85,14 +115,17 @@ def _msg_to_dict(content: str, tool_calls: list) -> dict:
     return d
 
 
-def build_initial_messages(issue: str, plan_text: str, baseline_summary: str) -> list:
+def build_initial_messages(issue: str, plan_text: str, baseline_summary: str,
+                           groups: tuple[str, ...] = ("core",),
+                           extra_context: str = "") -> list:
     return [
-        {"role": "system", "content": EXECUTOR_SYSTEM},
+        {"role": "system", "content": system_prompt(groups)},
         {"role": "user", "content": (
             f"## Issue\n{issue}\n\n"
             f"## 修复计划（Planner 产出，动手前先核实）\n{plan_text}\n\n"
-            f"## 基线测试结果（修改前）\n{baseline_summary}\n\n"
-            "开始吧。"
+            f"## 基线测试结果（修改前）\n{baseline_summary}\n"
+            + (f"\n{extra_context}\n" if extra_context else "")
+            + "\n开始吧。"
         )},
     ]
 
@@ -101,9 +134,10 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
                  trace: Trace) -> tuple[str, int]:
     """跑一轮 executor（就地修改 messages），返回 (最终总结文本, 峰值上下文 tokens)。"""
     peak_tokens = 0
+    tools = toolkit.specs()
 
     for _ in range(MAX_TURNS):
-        content, tool_calls, prompt_tokens = _stream_once(messages)
+        content, tool_calls, prompt_tokens = _stream_once(messages, tools)
         peak_tokens = max(peak_tokens, prompt_tokens)
         messages.append(_msg_to_dict(content, tool_calls))
 
@@ -120,7 +154,7 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
                 continue
 
-            needs_confirm = name not in SAFE_TOOLS and not perms.trust_all
+            needs_confirm = not is_safe(name, args) and not perms.trust_all
             tag = f" {YELLOW}(需确认){RESET}" if needs_confirm else ""
             shown = raw_args if len(raw_args) <= 90 else raw_args[:90] + "…"
             print(f"  {CYAN}🔧 {name}({shown}){RESET}{tag}")

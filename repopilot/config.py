@@ -51,7 +51,31 @@ MAX_TOOL_OUTPUT = 6000      # 单个工具返回值上限（字符），保护�
 MAX_TURNS = 40              # executor 单次最多循环圈数（真实仓库比 playground 圈数多）
 MAX_FIX_ATTEMPTS = 3        # 测试失败后最多整轮重试次数
 MAX_MODIFIED_FILES = 8      # 一次任务最多允许改动的文件数，防"改跑偏"
-CMD_TIMEOUT = 180           # 单条命令超时（秒）；测试命令放宽到 2 倍
+MAX_BASELINE_UNITS = 4      # monorepo 最多给几个子项目跑基线（基线不是免费的）
+CMD_TIMEOUT = 180           # 单条命令超时（秒）
+TEST_TIMEOUT = CMD_TIMEOUT * 2  # 测试/构建放宽到 2 倍（框架项目 build 很慢）
+
+# --- 探索子 agent（上下文隔离）---------------------------------------------
+# 它的价值不是分工，是【脏上下文留在它那边】：读十个文件九个没用，但九个都会
+# 永久留在主上下文里。子 agent 只把一句结论带回来。
+EXPLORER_MAX_TURNS = 20     # 子 agent 自己的圈数上限，比主循环紧
+EXPLORER_MAX_OUTPUT = 4000  # 子 agent 结论回填上限：它要是长篇大论就失去意义了
+
+# --- 运行时（把大型框架应用真正跑起来）--------------------------------------
+# 为什么单独一套超时：框架 dev server 冷启动要编译，Next.js/Spring 动辄 1~3 分钟，
+# 用 CMD_TIMEOUT 那套秒级思维会在真项目上一律超时。
+SERVICE_START_TIMEOUT = 180   # 单个服务等就绪上限（秒）
+SERVICE_LOG_LINES = 200       # 保留在内存里的日志行数（环形缓冲，防日志刷爆内存）
+MAX_SERVICES = 6              # 一次任务最多允许起的服务数，防"起了一屋子进程"
+
+# --- 浏览器（Playwright）---------------------------------------------------
+BROWSER_HEADLESS = os.environ.get("REPOPILOT_HEADED", "") == ""   # 设 REPOPILOT_HEADED=1 可看见浏览器
+BROWSER_VIEWPORT = {"width": 1440, "height": 900}
+BROWSER_TIMEOUT = 15_000      # 单个浏览器动作超时（毫秒）
+BROWSER_SNAPSHOT_CHARS = 4000  # 页面快照回填上限：一个页面能有几万字符，必须封顶
+# 浏览器只允许访问本地地址。**这是一道真正的安全边界**：不设的话，agent 可以
+# 用浏览器去敲内网服务（云元数据接口 169.254.169.254 是最经典的目标）。
+BROWSER_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1")
 
 RUNS_DIR = PROJECT_ROOT / "runs"       # 每次执行的轨迹目录
 CLONES_DIR = PROJECT_ROOT.parent / "targets"  # --repo 传 URL 时克隆到这里

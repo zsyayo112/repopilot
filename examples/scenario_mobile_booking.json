@@ -1,0 +1,15 @@
+{
+  "name": "mobile-booking-navigation",
+  "expectation": "在手机尺寸下，套餐详情页点『立即预订』应该跳转到 /orders/new",
+  "viewport": { "width": 390, "height": 844 },
+  "steps": [
+    { "action": "open", "url": "/packages/123" },
+    { "action": "screenshot", "name": "package-detail" },
+    { "action": "click", "role": "button", "name": "立即预订" }
+  ],
+  "assertions": [
+    { "type": "url", "value": "/orders/new" },
+    { "type": "no_console_errors" },
+    { "type": "no_failed_requests" }
+  ]
+}

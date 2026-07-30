@@ -7,7 +7,7 @@
 """
 
 from .config import BOLD, DIM, RED, RESET, YELLOW
-from .tools import SAFE_TOOLS
+from .tools import is_safe
 
 
 class Permissions:
@@ -15,7 +15,9 @@ class Permissions:
         self.trust_all = trust_all
 
     def check(self, name: str, args: dict) -> tuple[bool, str]:
-        if name in SAFE_TOOLS or self.trust_all:
+        # is_safe 而不是 `name in SAFE_TOOLS`：浏览器交互要看点的是什么按钮，
+        # "确认支付"这类不可逆意图必须回到人手上（见 policy.looks_irreversible）
+        if self.trust_all or is_safe(name, args):
             return True, ""
 
         self._show(name, args)
@@ -55,6 +57,16 @@ class Permissions:
                 print(f"{YELLOW}│{RESET}   {DIM}{line}{RESET}")
         elif name == "run_bash":
             print(f"{YELLOW}│{RESET} 命令:{BOLD}{args.get('command')}{RESET}")
+        elif name == "start_services":
+            # 这一条值得单独提示：启动命令来自目标仓库自己的配置
+            # （package.json 的 scripts 就是一个任意命令执行入口）
+            print(f"{YELLOW}│{RESET} {BOLD}即将执行目标仓库自己声明的启动命令{RESET}")
+            print(f"{YELLOW}│{RESET} {DIM}RepoPilot 已从子进程环境里剥掉所有 API key/token{RESET}")
+        elif name in ("browser_click", "browser_fill", "browser_select"):
+            target = args.get("ref") or args.get("name") or args.get("label") or "?"
+            print(f"{YELLOW}│{RESET} 目标：{BOLD}{target}{RESET}")
+            print(f"{YELLOW}│{RESET} {RED}这个操作看起来不可逆（付款/删除/下单一类），"
+                  f"所以没有自动放行{RESET}")
         else:
             print(f"{YELLOW}│{RESET} 参数：{args}")
         print(f"{YELLOW}└─ [y]同意  [a]本次运行全放行  [n]拒绝 ──────{RESET}")
