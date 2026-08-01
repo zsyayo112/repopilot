@@ -67,6 +67,32 @@ from .workspace import Workspace
 _SEVERITY = {"regressed": 4, "no_change": 3, "improved": 2, "fixed": 1, "still_green": 0}
 _OK_STATUSES = ("fixed", "still_green")
 
+# 预算闸门分两档 —— 超支的【种类】要和状态的【开销】对得上，一刀切会误伤。
+#   花 token 的状态：任何一种超支都拦。token 用光了还去调模型，
+#       调不出东西还要计费。
+#   只花时间的状态：只有【墙钟】超了才拦。一次全量验证要十几分钟，
+#       但一个 token 都不花 —— 为了 TOKEN_LIMIT 把它跳掉是白白丢掉信息，
+#       而这次评测真正被耗尽的资源是时间，不是 token。
+#   两张表都没有的：BASELINE（此时表刚起步，拦不到东西）以及
+#       REVIEW / REPORT / CLEANUP / DONE。REVIEW 不整体拦是因为它前半段
+#       （存 final.diff、跑补丁审计）不花钱又正好是评测要的产物，真正贵的
+#       那次模型调用由它内部自己查表；REPORT 之后是交卷路径，任何情况下
+#       都不许跳（见文件头第 1 条硬规则）。
+_TOKEN_SPENDING_STATES = ("PLAN", "EXECUTE")
+_TIME_ONLY_STATES = ("START_RUNTIME", "REPRODUCE", "VERIFY")
+
+
+def _gate_reason(state: str, ledger: Ledger) -> str | None:
+    """这个状态现在还准不准进。返回拦下的原因码，放行返回 None。"""
+    over = ledger.exhausted()
+    if over is None:
+        return None
+    if state in _TOKEN_SPENDING_STATES:
+        return over
+    if state in _TIME_ONLY_STATES:
+        return over if over == "TIMEOUT" else None
+    return None
+
 
 def solve(repo: str, issue: str, *, test_cmd: str | None = None,
           yes: bool = False, plan_only: bool = False,
@@ -197,6 +223,28 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
 
     while state != "DONE":   # DONE 是唯一真·终止态，一切结局都得先过 REPORT
         trace.event("state", state=state, attempt=attempt)
+
+        # ---- 墙钟闸门 -----------------------------------------------------
+        # 预算要真是硬约束，就得在【每次状态切换】上查，而不是只在 executor
+        # 的循环里查。实测过一条 pylint 实例：executor 314 秒就因 TOKEN_LIMIT
+        # 停了（还在预算内），随后 VERIFY 跑了 922 秒、停机决策 591 秒、
+        # REVIEW 进去再没出来 —— 1800 秒的预算跑成 65 分钟，而超支的那 35 分钟
+        # 全发生在 executor 之外，没有任何一处代码在看表。
+        #
+        # 闸门只能拦【状态入口】，拦不住已经进去的一次调用：一次全量测试可以
+        # 跑满 TEST_TIMEOUT，一次模型调用可以在网络退避里耗掉几分钟。所以外层
+        # harness 还要有一道硬杀（eval/run.py），两道合起来才封得住。
+        if over := _gate_reason(state, ledger):
+            print(f"\n{RED}[预算闸门] {over} —— {ledger.summary()}{RESET}")
+            print(f"{RED}  在进入 {state} 之前停下，交出当前最佳补丁。{RESET}")
+            trace.event("budget_gate", state=state, code=over,
+                        elapsed_secs=round(ledger.elapsed, 1))
+            halt_code = halt_code or over
+            _restore_best(ws, halting, trace)
+            if comparison is None:
+                comparison = _unverified_comparison(over)
+            state = "REVIEW"
+            continue
 
         if state == "BASELINE":
             print(f"{YELLOW}[基线] 修改前先跑一遍测试…{RESET}")
@@ -352,6 +400,21 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
                 # 而不是悄悄跳过让报告看起来一样。
                 print(f"{DIM}[审查] 本次运行按预算关闭了独立审查（消融配置）。{RESET}")
                 trace.event("review_skipped", reason="budget.allow_reviewer=False")
+                state = "REPORT"
+                continue
+
+            # 预算耗尽还去调 Reviewer，是评测卡死的直接原因：executor 那边早就
+            # 因为超支停了，REVIEW 却又开了一次谁都没在看表的模型调用，撞上网络
+            # 退避（每次 10+30+60+120 秒，json_call 还能再叠三倍）之后，一条实例
+            # 在这里卡了半小时。
+            #
+            # 这和上面那个消融开关是【两件事】，所以分开记：那个是"这次实验故意
+            # 不要这一层"，这个是"想要但没钱了"。报告里混成一句会让消融结论失真。
+            if over := ledger.exhausted():
+                print(f"{YELLOW}[审查] 预算已耗尽（{over}），跳过独立审查 —— "
+                      f"补丁照常交出，但这一层是缺的。{RESET}")
+                trace.event("review_skipped", reason=f"budget_exhausted:{over}")
+                halt_code = halt_code or over
                 state = "REPORT"
                 continue
 
@@ -605,6 +668,20 @@ def _restore_best(ws, halting: HaltingPolicy, trace) -> None:
     trace.event("rollback", to_attempt=best.attempt, failures=best.failures, applied=ok)
     print(f"{YELLOW}[回滚] 已{'' if ok else '尝试'}回到第 {best.attempt} 轮的补丁"
           f"（失败 {best.failures} 个）{'' if ok else '——但补丁重放失败，现场已复位'}{RESET}")
+
+
+def _unverified_comparison(code: str) -> dict:
+    """预算在跑出【任何一次】验证之前就耗尽了，但报告仍然要出。
+
+    这里绝不能填一个看起来正常的状态。写 "no_change" 的话，失败归因和
+    报告都会把它当成"真的跑过测试、结果没变"来统计 —— 那是一句凭空捏造的
+    观测。补丁没被验证过是另一个事实，得让它在下游一眼可见：
+    "unverified" 不在 _OK_STATUSES 里，所以这条实例判不了成功；
+    confidence="none" 让它在可信度分布里也和真跑过的那些分开。
+    """
+    return {"status": "unverified", "confidence": "none",
+            "baseline": "(未完成)", "after": f"(预算耗尽 {code}，未执行验证)",
+            "new_failures": []}
 
 
 def _rebuild_comparison(halting: HaltingPolicy, current: dict) -> tuple[dict, None]:

@@ -187,6 +187,61 @@ def cmd_infer(args):
             f"tokens={led.get('total_tokens', 0)} {res.get('wall_secs')}s")
 
 
+def _kill_group(proc, grace: float = 10.0) -> None:
+    """杀掉子进程【所在的整个进程组】，先 TERM 后 KILL。
+
+    两级信号是有意的：TERM 给 pytest 一个把临时文件和覆盖率数据写完再退的
+    机会，等 grace 秒还赖着不走才上 KILL。直接 KILL 会在工作树里留下半截
+    文件，下一条实例 prepare 的时候要么报错要么把脏状态带进去。
+    """
+    import signal
+    import subprocess
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return                      # 已经死了
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _stamp_harness_timeout(out_dir: Path, note: str, limit: int) -> None:
+    """给被硬杀的实例补一份 inference.json（外加一份空 agent.patch）。
+
+    不补的话下游会连着错两次：report.load_rows 只看得到一个空行，失败归因
+    把它归进 UNKNOWN；而 grade 那边先判 inference.json 存在、再直接读
+    agent.patch，缺文件会当场抛 FileNotFoundError 把整批判分带崩。
+
+    补出来的 halt_code 是 TIMEOUT —— 分类表里 TIMEOUT 排在 NO_PATCH 前面，
+    所以这条会正确地落进"超时"而不是"跑完了但没改代码"。这两件事必须分开：
+    一个是线束掐断的，一个是 agent 自己没做出来。killed_by_harness 这个字段
+    就是留给事后区分"谁掐的"用的。
+
+    写下 inference.json 也意味着【重跑会跳过这条】—— 超时是一个真实结果，
+    不是一次没发生的运行。想重来用 --force。
+    """
+    (out_dir / "inference.json").write_text(json.dumps({
+        "ok": False,
+        "halt_code": "TIMEOUT",
+        "error": note,
+        "killed_by_harness": True,
+        "empty_patch": True,
+        "patch_bytes": 0,
+        "wall_secs": limit,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    patch = out_dir / "agent.patch"
+    if not patch.exists():
+        patch.write_text("", encoding="utf-8")
+
+
 def _infer_parallel(args, insts, run_dir):
     """按【实例】并发。每个实例一个子进程，输出各自落盘。
 
@@ -202,6 +257,12 @@ def _infer_parallel(args, insts, run_dir):
     【为什么默认并发度这么低】瓶颈是内存不是 CPU：本机 12 核但只有 7GB，
     而 seaborn 单次 pytest 峰值 1.4GB。开满核会 OOM，OOM 出来的失败会被
     记成实例失败 —— 又是一次"评测者自己造成的失败记到被测方案头上"。
+
+    【为什么这里必须有硬超时】--timeout 是给状态机看的预算，而状态机只能在
+    状态入口查表：它拦不住一次已经开跑的全量测试，也拦不住一次卡在网络退避
+    里的模型调用。实测一条实例这样跑成了 65 分钟（预算 30 分钟），另外两条
+    在 97 / 73 分钟上被机器重启打断，整批 15 条只跑完 4 条。软预算加硬杀
+    才封得住：软的负责"该停就停得体面"，硬的负责"无论如何都会停"。
     """
     import subprocess
     from concurrent.futures import ThreadPoolExecutor
@@ -211,7 +272,8 @@ def _infer_parallel(args, insts, run_dir):
     skipped = len(insts) - len(pending)
     if skipped:
         log(f"{skipped} 条已跑过，跳过（--force 可重跑）")
-    log(f"并发 {args.workers} 跑 {len(pending)} 条")
+    hard = args.hard_timeout or args.timeout * 2
+    log(f"并发 {args.workers} 跑 {len(pending)} 条（预算 {args.timeout}s / 硬杀 {hard}s）")
 
     def one(inst):
         out_dir = run_dir / inst.instance_id
@@ -227,7 +289,20 @@ def _infer_parallel(args, insts, run_dir):
         if args.force:
             cmd.append("--force")
         with (out_dir / "infer.log").open("w", encoding="utf-8") as f:
-            code = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
+            # start_new_session：把子进程放进它自己的进程组。超时要杀的是
+            # 【整棵树】—— agent 会派 pytest 出去，只杀直接子进程会留下一地
+            # 孤儿 pytest，而这台机器的瓶颈正是内存，孤儿会把后面的实例拖垮。
+            proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+            try:
+                code = proc.wait(timeout=hard)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc)
+                note = f"线束硬超时：子进程超过 {hard}s 未退出，已连同进程组一起杀掉"
+                f.write(f"\n[harness] {note}\n")
+                f.flush()
+                _stamp_harness_timeout(out_dir, note, hard)
+                return f"{inst.instance_id}: 硬超时 >{hard}s，已杀掉并记为 TIMEOUT"
         res = out_dir / "inference.json"
         if res.exists():
             d = json.loads(res.read_text())
@@ -351,6 +426,12 @@ def main():
     i.add_argument("--timeout", type=int, default=1800)
     i.add_argument("--test-timeout", type=int, default=900,
                    help="agent 单次跑测试的超时（秒）。全量套件比 scope 过的慢得多")
+    i.add_argument("--hard-timeout", type=int, default=None,
+                   help="线束硬杀子进程的墙钟上限（秒），默认 --timeout 的 2 倍。"
+                        "这是兜底不是预算：状态机的墙钟闸门拦的是状态入口，"
+                        "拦不住已经进去的一次全量测试或一次卡住的模型调用。"
+                        "只在 --workers>1 时生效（串行模式没有父进程可以下手，"
+                        "那时请在外面套 timeout(1)）")
     i.add_argument("--child", action="store_true",
                    help="内部使用：由并发启动器设置，表示「我是整批里的一个切片」，"
                         "因此不重写 manifest（权威 manifest 由父进程写一次）")

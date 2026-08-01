@@ -190,6 +190,93 @@ def test_reviewer_rejection_triggers_another_round(git_repo, tmp_path, monkeypat
     assert res["halt_code"] == "REVIEWER_REPEAT"
 
 
+def _green_pipeline(monkeypatch, report):
+    """基线绿、验证绿、lint/build 全过 —— 只留预算这一个变量。"""
+    monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: report)
+    monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
+        "status": "still_green", "new_failures": [], "confidence": "high",
+        "baseline": "g", "after": "g"})
+    monkeypatch.setattr(orchestrator, "run_validation",
+                        lambda *a, **k: type("V", (), {"ok": True, "steps": [],
+                                                       "render": lambda self: ""})())
+
+
+def test_wall_clock_gate_stops_before_verify_and_review(git_repo, tmp_path, monkeypatch):
+    """墙钟超了就不许再进 VERIFY / Reviewer —— 但仍然要走完 REPORT 交卷。
+
+    这条守的是一次真实事故：executor 自己在 1757 秒（预算 1800）停了，
+    随后 VERIFY 又跑了 15 分钟、Reviewer 又卡在网络退避里 30 分钟，
+    一条 30 分钟预算的实例跑成 65 分钟。超支的部分全在 executor 之外，
+    而那时没有任何一处代码在看表。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    green = TestReport(exit_code=0, passed=3, parsed=True)
+    _green_pipeline(monkeypatch, green)
+
+    verifies = []
+    monkeypatch.setattr(orchestrator, "run_tests_in",
+                        lambda *a, **k: (verifies.append(1), green)[1])
+
+    def fake_exec(toolkit, perms, messages, trace, *, ledger=None, **kw):
+        (git_repo / "a.py").write_text("x = 1\n")
+        ledger.started_at -= 10_000        # 把表拨到 1800 秒预算之外
+        return ("done", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
+
+    def boom_review(*a, **k):
+        raise AssertionError("预算耗尽后不该再开一次模型调用")
+    monkeypatch.setattr(orchestrator, "review", boom_review)
+
+    out = tmp_path / "r.json"
+    code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                              budget=Budget(instance_timeout=1800), result_path=str(out))
+
+    assert code == 1
+    assert verifies == [], "墙钟已经超了，不该再花十几分钟跑一次全量验证"
+    res = json.loads(out.read_text())
+    assert res["halt_code"] == "TIMEOUT"
+    # 没验证过就【不许】写一个像样的状态："no_change" 会被下游当成真跑过测试
+    assert res["test_status"] == "unverified"
+    assert (git_repo / "a.py").read_text() == "x = 1\n", "补丁该照常交出来"
+
+
+def test_token_limit_still_verifies_but_skips_reviewer(git_repo, tmp_path, monkeypatch):
+    """token 用光 ≠ 时间用光：验证不花 token，该跑还得跑；Reviewer 花，跳。
+
+    一刀切地"超支就什么都不做"会白白丢掉验证信息 —— 而这次评测真正被耗尽的
+    资源是时间，不是 token。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    green = TestReport(exit_code=0, passed=3, parsed=True)
+    _green_pipeline(monkeypatch, green)
+
+    verifies = []
+    monkeypatch.setattr(orchestrator, "run_tests_in",
+                        lambda *a, **k: (verifies.append(1), green)[1])
+
+    def fake_exec(toolkit, perms, messages, trace, *, ledger=None, **kw):
+        (git_repo / "a.py").write_text("x = 1\n")
+        ledger.prompt_tokens = ledger.budget.token_budget + 1
+        return ("done", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
+
+    def boom_review(*a, **k):
+        raise AssertionError("token 已耗尽，不该再开一次模型调用")
+    monkeypatch.setattr(orchestrator, "review", boom_review)
+
+    out = tmp_path / "r.json"
+    orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                       budget=Budget(instance_timeout=1800), result_path=str(out))
+
+    assert verifies, "TOKEN_LIMIT 不该把验证也拦掉 —— 跑一次测试一个 token 都不花"
+    res = json.loads(out.read_text())
+    assert res["halt_code"] == "TOKEN_LIMIT"
+    assert res["test_status"] == "still_green"
+    # "想要审查但没钱了" 和 "这次实验故意关掉审查" 是两件事，报告里不能混
+    assert res["reviewer"]["enabled"] is True
+    assert res["reviewer"]["decision"] is None
+
+
 def test_result_json_carries_budget_and_ledger(git_repo, tmp_path, monkeypatch):
     """result.json 是评测线束唯一的判据入口，关键字段必须齐。"""
     _stub_common(monkeypatch, tmp_path)
