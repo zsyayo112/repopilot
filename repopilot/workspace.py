@@ -12,6 +12,8 @@
 import subprocess
 from pathlib import Path
 
+from .execenv import HostExecutor
+
 
 class Workspace:
     def __init__(self, root: str | Path):
@@ -21,6 +23,9 @@ class Workspace:
                 f"{self.root} 不是 git 仓库。MVP 要求目标在 git 管理下 —— "
                 "这是改砸后能回滚的唯一保障。"
             )
+        # 命令在哪里执行（宿主 / 容器）。git 与文件 I/O 永远留在宿主 ——
+        # 评测时仓库以 bind-mount 与容器共享，两侧看到同一棵树。
+        self.exec = HostExecutor()
 
     # -- 构造 ---------------------------------------------------------------
     @classmethod

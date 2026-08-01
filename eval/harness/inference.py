@@ -108,11 +108,23 @@ def run_one(inst: PublicInstance, env: Env, *, variant: str, budget: Budget,
     return result
 
 
+def _executor_for(env: Env):
+    """docker 模式 → DockerExecutor（命令进官方容器）；venv 模式 → None（宿主）。"""
+    if env.exec_mode == "docker":
+        from repopilot.execenv import DockerExecutor
+        return DockerExecutor(env.container_name, Path(env.repo_dir),
+                              env.container_python)
+    return None
+
+
 def _dispatch(variant: str, inst: PublicInstance, env: Env, budget: Budget,
               out_dir: Path) -> dict:
     if variant.startswith("baseline"):
         from . import baselines
         ws = Workspace(env.repo_dir)
+        ex = _executor_for(env)
+        if ex is not None:
+            ws.exec = ex
         if variant == "baseline-a":
             return baselines.run_baseline_a(env, inst.problem_statement, budget, out_dir)
         profile = detect(env.repo_dir, env.test_cmd)
@@ -125,7 +137,7 @@ def _dispatch(variant: str, inst: PublicInstance, env: Env, budget: Budget,
     result_path = out_dir / "solve_result.json"
     solve(str(env.repo_dir), inst.problem_statement,
           test_cmd=env.test_cmd, yes=True, budget=budget,
-          result_path=str(result_path))
+          result_path=str(result_path), executor=_executor_for(env))
     if result_path.exists():
         return json.loads(result_path.read_text())
     return {"ok": False, "halt_code": "NO_RESULT",

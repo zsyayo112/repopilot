@@ -42,7 +42,8 @@ sys.path.insert(0, str(ROOT))
 # 靠脚本自己把项目根塞进搜索路径。E402 在这里是有意的。
 from harness import dataset  # noqa: E402
 from harness import manifest as manifest_mod  # noqa: E402
-from harness.environment import Env, env_dir, prepare  # noqa: E402
+from harness.environment import (  # noqa: E402
+    Env, ensure_container, env_dir, env_usable, prepare, stop_container)
 from harness.instances import PublicInstance  # noqa: E402
 
 RUNS_DIR = EVAL_DIR / "runs"
@@ -77,6 +78,11 @@ def _load_env(instance_id: str) -> Env | None:
     known = set(Env.__dataclass_fields__)
     env = Env(**{k: v for k, v in data.items() if k in known and k != "repo_dir"})
     env.repo_dir = env_dir(instance_id) / "repo"
+    if env.ok and not env_usable(env):
+        # 显式失效胜过静默坏路径：venv 曾被整体摧毁过一次（symlink 事故），
+        # 那之后所有 env.json 里的 venv_py 都指向不存在的解释器。
+        env.ok = False
+        env.error = "环境已失效（venv 被销毁或容器信息缺失），请重新 prepare"
     return env
 
 
@@ -94,7 +100,8 @@ def cmd_prepare(args):
     """环境层。这一层可以缓存、可以跨 agent 版本复用，因为它不含任何 agent 产出。"""
     for inst in _instances(args.split, args.only):
         log(f"=== {inst.instance_id} ===")
-        env = prepare(inst, force=args.force, baseline_timeout=args.baseline_timeout)
+        env = prepare(inst, force=args.force, baseline_timeout=args.baseline_timeout,
+                      exec_mode=args.exec_mode)
         log(f"  {'✓ 就绪' if env.ok else '✗ ' + env.error[:120]}"
             + (f"  测试范围：{env.test_roots or '全量'}"
                f"  全量耗时 {env.baseline_secs}s"
@@ -114,8 +121,15 @@ def cmd_calibrate(args):
             log(f"{inst.instance_id}: 环境未就绪，跳过校准（仍留在分母里）")
             continue
         log(f"=== {inst.instance_id} gold 校准 ===")
-        out = grader.calibrate_gold(env, secrets[inst.instance_id],
-                                    timeout=args.timeout)
+        ok, note = ensure_container(env)
+        if not ok:
+            log(f"  容器起不来，跳过：{note[:120]}")
+            continue
+        try:
+            out = grader.calibrate_gold(env, secrets[inst.instance_id],
+                                        timeout=args.timeout)
+        finally:
+            stop_container(env)
         stamp = env_dir(inst.instance_id) / "gold.json"
         stamp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"  gold_ok = {out['gold_ok']}  {out['gold_note'][:100]}")
@@ -186,7 +200,20 @@ def cmd_infer(args):
             json.dumps(env.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
         log(f"=== {inst.instance_id} [{args.variant}] ===")
-        res = run_one(inst, env, variant=args.variant, budget=budget, out_dir=out_dir)
+        ok, note = ensure_container(env)
+        if not ok:
+            # 容器起不来按环境失败记：实例留在分母里，报告单列
+            env.ok, env.error = False, note
+            (out_dir / "env.json").write_text(json.dumps(
+                env.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            log(f"{inst.instance_id}: {note[:120]}（记为环境失败）")
+            continue
+        try:
+            res = run_one(inst, env, variant=args.variant, budget=budget,
+                          out_dir=out_dir)
+        finally:
+            # 逐实例释放内存：8GB 的机器上并发能开 2 全靠随手关容器
+            stop_container(env)
         led = res.get("ledger") or {}
         log(f"  → halt={res.get('halt_code') or '正常'} "
             f"patch={res.get('patch_bytes', 0)}B "
@@ -356,7 +383,14 @@ def cmd_grade(args):
             continue
         log(f"=== {iid} 判分 ===")
         patch = (out_dir / "agent.patch").read_text(encoding="utf-8")
-        res = grader.grade_patch(env, secrets[iid], patch, timeout=args.timeout)
+        ok, note = ensure_container(env)
+        if not ok:
+            log(f"  容器起不来，跳过判分：{note[:120]}")
+            continue
+        try:
+            res = grader.grade_patch(env, secrets[iid], patch, timeout=args.timeout)
+        finally:
+            stop_container(env)
 
         # gold 校准结果并进来（它是 prepare/calibrate 阶段的产物）
         gold_file = env_dir(iid) / "gold.json"
@@ -415,6 +449,28 @@ def cmd_compare(args):
     log(f"已写入 {out}")
 
 
+def cmd_containers(args):
+    """评测容器的家务：看状态 / 停 / 删。镜像清理指引一并给出。"""
+    import subprocess as sp
+
+    out = sp.run(["docker", "ps", "-a", "--filter", "name=repopilot.",
+                  "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"],
+                 capture_output=True, text=True).stdout.strip()
+    if not out:
+        print("没有 repopilot.* 容器。")
+        return
+    names = [line.split("\t")[0] for line in out.splitlines()]
+    print(out)
+    if args.stop or args.rm:
+        for n in names:
+            sp.run(["docker", "rm", "-f", n] if args.rm else
+                   ["docker", "stop", "-t", "2", n], capture_output=True)
+        print(f"已{'删除' if args.rm else '停止'} {len(names)} 个容器。")
+    if args.rm:
+        print("镜像未动。要回收磁盘：docker rmi swebench/sweb.eval.x86_64.<iid>"
+              "（每个 2.5-5GB），或 docker system df 看可回收量。")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -432,6 +488,9 @@ def main():
         c.add_argument("--timeout", type=int, default=1800)
         c.add_argument("--baseline-timeout", type=int, default=900,
                        help="量全量套件耗时的上限。超了只记录，不判死实例")
+        c.add_argument("--exec-mode", default="docker", choices=("docker", "venv"),
+                       help="docker=官方 SWE-bench 镜像 + 长驻容器（v0.6 默认）；"
+                            "venv=旧路径，仅为老分支保留")
 
     i = sub.add_parser("infer", help="推理（不接触任何答案）")
     i.add_argument("--split", default="dev", choices=("dev", "test", "holdout"))
@@ -478,10 +537,15 @@ def main():
     c.add_argument("--b", required=True)
     c.add_argument("--extra", nargs="*")
 
+    k = sub.add_parser("containers", help="评测容器的查看与清理")
+    k.add_argument("--stop", action="store_true", help="停掉所有 repopilot.* 容器")
+    k.add_argument("--rm", action="store_true", help="删掉所有 repopilot.* 容器"
+                   "（下次 infer 会重建并重跑修补；镜像不动）")
+
     args = p.parse_args()
     {"freeze": cmd_freeze, "prepare": cmd_prepare, "calibrate": cmd_calibrate,
      "infer": cmd_infer, "grade": cmd_grade, "report": cmd_report,
-     "compare": cmd_compare}[args.cmd](args)
+     "compare": cmd_compare, "containers": cmd_containers}[args.cmd](args)
 
 
 if __name__ == "__main__":

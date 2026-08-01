@@ -29,6 +29,32 @@ import json
 from pathlib import Path
 
 from . import failures
+from .environment import env_dir
+
+
+def official_overlay(inst_dir: Path, merged: dict) -> None:
+    """官方判分叠加层：有官方结论时它就是主口径。
+
+    - <run>/<iid>/official_grade.json 存在且 judged → resolved 用官方结论，
+      本地判分降级成 local_resolved（诊断字段，用于量本地判分器的误差）。
+    - eval/envs/<iid>/official_gold.json 存在 → gold_ok 用官方 gold 校准，
+      本地校准降级成 local_gold_ok。
+    下游 summarize / 失败归因 / repeats 聚合全部只读 merged 行，
+    所以 certifiable 门自动跟着切换，不需要再改任何函数。
+    """
+    og = inst_dir / "official_grade.json"
+    if og.exists():
+        o = json.loads(og.read_text())
+        if o.get("judged"):
+            merged["local_resolved"] = merged.get("resolved")
+            merged["resolved"] = o.get("resolved")
+            merged["judge"] = o.get("judge", "swebench-official-docker")
+    gold = env_dir(inst_dir.name) / "official_gold.json"
+    if gold.exists():
+        g = json.loads(gold.read_text())
+        merged["local_gold_ok"] = merged.get("gold_ok")
+        merged["gold_ok"] = g.get("gold_ok")
+        merged["gold_source"] = "official"
 
 
 def load_rows(run_dir: Path) -> list[dict]:
@@ -45,6 +71,7 @@ def load_rows(run_dir: Path) -> list[dict]:
                     merged["env_error"] = data.get("error", "")
                 else:
                     merged.update(data)
+        official_overlay(d, merged)
         merged["failure_category"] = failures.classify(merged)
         rows.append(merged)
     return rows
@@ -88,7 +115,15 @@ def summarize(rows: list[dict], manifest: dict) -> dict:
     certifiable = [r for r in rows if r.get("gold_ok") is not False
                    and r.get("env_ok") is not False]
 
+    # 判分口径与本地/官方分歧：分歧本身是本地判分器误差的直接测量
+    official_rows = [r for r in rows if r.get("judge") == "swebench-official-docker"]
+    judge_diff = sum(1 for r in official_rows
+                     if r.get("local_resolved") is not None
+                     and bool(r.get("local_resolved")) != bool(r.get("resolved")))
+
     return {
+        "official_judged": len(official_rows),
+        "judge_disagreements": judge_diff,
         "frozen_total": frozen,
         "resolved": len(resolved),
         "resolved_rate": len(resolved) / frozen if frozen else 0.0,
@@ -183,6 +218,8 @@ def render(run_dir: Path, rows: list[dict], manifest: dict) -> str:
         f"| 平均耗时 | {s['avg_secs']:.0f}s |",
         f"| 单实例平均成本 | {cost} |",
         f"| 本次总成本 | {total_cost} |",
+        f"| 官方判分覆盖 | {s['official_judged']}/{s['frozen_total']} |",
+        f"| 本地/官方判分分歧 | {s['judge_disagreements']} |",
     ]
     if s["reviewer_enabled"]:
         out += [
@@ -221,6 +258,10 @@ def render(run_dir: Path, rows: list[dict], manifest: dict) -> str:
             f"{r.get('wall_secs', '')} | {flags[:48]} |")
 
     out += ["", "## 口径声明", "",
+            "- resolved 的主口径是【官方 SWE-bench Docker 判分器】"
+            "（official_grade.json）；没有官方结论的实例回退本地判分，"
+            "judge 字段留痕。gold 可判定门同样以官方 gold 校准为准"
+            "（eval/envs/<iid>/official_gold.json）。",
             "- 分母是【推理开始前冻结】的实例清单，跑不起来的实例留在分母里，"
             "只在上表中单列，绝不从分母删除。",
             "- gold 校准在推理【之前】完成，结果不受 agent 表现影响。",

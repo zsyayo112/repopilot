@@ -104,7 +104,13 @@ class Env:
 
     instance_id: str
     repo_dir: Path | None = None
-    venv_py: str = ""
+    venv_py: str = ""              # venv 模式专用；docker 模式恒为 ""（杜绝静默坏路径）
+    exec_mode: str = ""            # "docker" | "venv"；旧 env.json 的空串按 venv 论
+    container_image: str = ""      # 官方 SWE-bench 镜像
+    container_name: str = ""       # 长驻容器名 repopilot.<iid>
+    container_python: str = ""     # 容器内 conda testbed 的解释器
+    pristine_sha: str = ""         # 环境基线 commit：reset() 的复位点、patch 的基准
+    prepare_leftovers: str = ""    # 基线跑完树不干净时的残留清单（可见性，不判死）
     python_version: str = ""       # 实际用的解释器版本，进 manifest 和报告
     requires_python: str = ""      # 仓库自己声明的约束，选择依据
     commit_date: str = ""          # base_commit 的日期，依赖时间线的截止点
@@ -137,12 +143,26 @@ def _stamp(instance_id: str) -> Path:
     return env_dir(instance_id) / "env.json"
 
 
+def official_image(instance_id: str) -> str:
+    """官方 SWE-bench per-instance 镜像名。命名规则来自官方 harness。"""
+    return f"swebench/sweb.eval.x86_64.{instance_id.replace('__', '_1776_')}:latest"
+
+
+def env_usable(env: Env) -> bool:
+    """env.json 是否还能用。venv 模式解释器必须真实存在 —— venv 曾被整体
+    摧毁过一次（1dbef3 的 symlink 事故），静默的坏路径比显式失败糟得多。"""
+    if env.exec_mode == "docker":
+        return bool(env.container_image and env.container_name)
+    return bool(env.venv_py) and Path(env.venv_py).exists()
+
+
 def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False,
-            baseline_timeout: int = 900) -> Env:
-    """克隆 → checkout base_commit → 建 venv 装依赖 → 探测测试命令 → 跑一次基线。
+            baseline_timeout: int = 900, exec_mode: str = "docker") -> Env:
+    """把实例环境准备好：v0.6 起默认 docker（官方镜像 + 长驻容器），
+    venv 是旧路径，仅为老分支保留。
 
     做过一次就把结果盖章存进 env.json，后续运行直接读 —— 这是最值钱的一层
-    缓存（装依赖动辄一两分钟，30 个实例就是一小时）。
+    缓存。缓存只有在【模式匹配且仍然可用】时才命中。
     """
     log = (lambda *a: None) if quiet else print
     stamp = _stamp(inst.instance_id)
@@ -153,12 +173,22 @@ def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False,
         known = set(Env.__dataclass_fields__)
         cached = Env(**{k: v for k, v in data.items() if k in known and k != "repo_dir"})
         cached.repo_dir = env_dir(inst.instance_id) / "repo"
-        if cached.ok and cached.repo_dir.exists():
+        if cached.ok and cached.repo_dir.exists() and env_usable(cached) \
+                and (cached.exec_mode or "venv") == exec_mode:
             return cached
 
     wd = env_dir(inst.instance_id)
     wd.mkdir(parents=True, exist_ok=True)
     env = Env(instance_id=inst.instance_id, prepared_at=time.time())
+    if exec_mode == "docker":
+        return _prepare_docker(inst, env, wd, stamp, log, baseline_timeout)
+    return _prepare_venv(inst, env, wd, stamp, log, baseline_timeout)
+
+
+def _prepare_venv(inst: PublicInstance, env: Env, wd: Path, stamp: Path,
+                  log, baseline_timeout: int) -> Env:
+    """旧路径：克隆 → checkout → venv 装依赖 → 探测 → 基线。"""
+    env.exec_mode = "venv"
 
     # -- 1. 仓库（跨实例共享的那份克隆）--
     cache = REPO_CACHE / inst.repo.replace("/", "__")
@@ -228,6 +258,197 @@ def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False,
     env.ok = True
     _save(env, stamp)
     return env
+
+
+# ---------------------------------------------------------------------------
+# docker 模式：官方 SWE-bench 镜像 + 长驻容器
+#
+# 分工（与 repopilot/execenv.py 呼应）：
+#   执行（pytest / run_bash）      → 容器内，era-correct 的解释器和依赖
+#   git / 文件读写 / 探索          → 宿主，操作 bind-mount 的同一棵树
+# worktree 从镜像里 docker cp 出来（连 .git 和镜像构建时的 sed 一起），
+# 保证 patch 的上下文与官方 judge 的 /testbed 逐字节一致。
+# ---------------------------------------------------------------------------
+
+def _prepare_docker(inst: PublicInstance, env: Env, wd: Path, stamp: Path,
+                    log, baseline_timeout: int) -> Env:
+    from repopilot.execenv import CONTAINER_PYTHON, DockerExecutor
+
+    env.exec_mode = "docker"
+    env.container_image = official_image(inst.instance_id)
+    env.container_name = f"repopilot.{inst.instance_id}"
+    env.container_python = CONTAINER_PYTHON
+
+    # -- 1. 镜像 --
+    code, _ = sh(["docker", "image", "inspect", env.container_image], timeout=120)
+    if code != 0:
+        log(f"  拉取官方镜像 {env.container_image} …")
+        code, out = sh(["docker", "pull", "-q", env.container_image], timeout=3600)
+        if code != 0:
+            return _fail(env, stamp, f"官方镜像拉取失败：{out[-300:]}")
+
+    # -- 2. worktree：从镜像把 /testbed 连 .git 一起搬出来 --
+    # 走到这里说明缓存未命中（无 stamp / 失效 / --force）——旧树不可信，重建。
+    # 必须先拆容器再动树：容器 bind-mount 着旧 inode，先删树会让它挂在幽灵目录上。
+    repo_dir = wd / "repo"
+    sh(["docker", "rm", "-f", env.container_name], timeout=120)
+    if repo_dir.exists():
+        shutil.rmtree(repo_dir)
+    log("  从镜像导出 /testbed 工作树…")
+    partial = wd / "repo.partial"
+    if partial.exists():
+        shutil.rmtree(partial)
+    scratch = f"repopilot-cp.{inst.instance_id}"
+    sh(["docker", "rm", "-f", scratch], timeout=60)
+    code, out = sh(["docker", "create", "--name", scratch, env.container_image],
+                   timeout=300)
+    if code != 0:
+        return _fail(env, stamp, f"docker create 失败：{out[-300:]}")
+    code, out = sh(["docker", "cp", "-q", f"{scratch}:/testbed", str(partial)],
+                   timeout=1800)
+    sh(["docker", "rm", "-f", scratch], timeout=60)
+    if code != 0:
+        shutil.rmtree(partial, ignore_errors=True)
+        return _fail(env, stamp, f"docker cp /testbed 失败：{out[-300:]}")
+    partial.rename(repo_dir)   # 原子改名：WSL 死在拷贝中途也不会留下半棵树
+    env.repo_dir = repo_dir
+    env.commit_date = commit_date(repo_dir, inst.base_commit)
+    env.requires_python = read_requires_python(repo_dir)
+
+    # 模式位不参与 diff：镜像构建时 chmod -R 777，宿主编辑又会写回 644，
+    # 两边都是噪声，patch 里混进整行 mode 变更毫无意义。
+    sh(["git", "config", "core.fileMode", "false"], cwd=repo_dir)
+    _write_git_excludes(repo_dir)
+
+    # -- 3. 长驻容器 + 一次性修补（editable 化 + chown 归还宿主 uid）--
+    ok, note = ensure_container(env)
+    if not ok:
+        return _fail(env, stamp, note)
+    if note:
+        env.install_note = note
+
+    # -- 4. 环境基线 commit：镜像侧的 sed / egg-info / editable 修补一起封进基线。
+    # 从此 reset() 复位到的就是"官方 judge 眼中的 /testbed"，agent patch 的
+    # 上下文与判分侧逐字节一致，且这些环境改动永远不会漏进 patch。
+    code, out = sh(["git", "status", "--porcelain"], cwd=repo_dir)
+    if out.strip():
+        sh(["git", "add", "-A"], cwd=repo_dir)
+        sh(["git", "-c", "user.name=repopilot", "-c", "user.email=repopilot@local",
+            "commit", "-q", "-m", "repopilot: 镜像侧环境改动封进基线"], cwd=repo_dir)
+    code, out = sh(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    env.pristine_sha = out.strip()[:40] if code == 0 else ""
+
+    # -- 5. 探测 pytest 参数 + 收集（容器内，环境闸门）--
+    ex = DockerExecutor(env.container_name, repo_dir, env.container_python)
+    runner = lambda cmd, timeout=600: _from_exec(ex.run(cmd, cwd=repo_dir,
+                                                        timeout=timeout))
+    code, out = runner(f"{env.container_python} -c "
+                       f"'import sys; print(\"%d.%d\" % sys.version_info[:2])'", 120)
+    env.python_version = out.strip().splitlines()[-1] if code == 0 and out.strip() else ""
+
+    log("  探测 pytest 参数 + 收集测试（容器内，环境闸门）…")
+    env.test_roots = discover_test_roots(repo_dir)
+    flags, err = probe_flags(env.container_python, repo_dir, env.test_roots,
+                             runner=runner)
+    if not flags:
+        stop_container(env)
+        return _fail(env, stamp, f"测试收集失败（各组参数都不行）：{err[-400:]}")
+    env.test_flags = flags
+    env.test_cmd = derive_test_command(env.container_python, env.test_roots, flags)
+    env.collect_exit = 0
+
+    # -- 6. 量基线耗时（度量不是闸门，超时不判死）--
+    log("  量基线耗时（容器内）…")
+    t0 = time.time()
+    code, out = runner(env.test_cmd, baseline_timeout)
+    env.baseline_secs = round(time.time() - t0, 1)
+    env.baseline_exit = code
+    env.baseline_timed_out = code == -1
+
+    # -- 7. 干净断言：基线跑完树必须回到 pristine，残留要被看见 --
+    code, out = sh(["git", "status", "--porcelain"], cwd=repo_dir)
+    if out.strip():
+        env.prepare_leftovers = out.strip()[:500]
+        reset(env)
+
+    stop_container(env)   # prepare 完就停，infer 时 ensure_container 会再拉起
+    env.ok = True
+    _save(env, stamp)
+    return env
+
+
+def _from_exec(r) -> tuple[int, str]:
+    """ExecResult → sh() 的 (code, output) 约定，probe/基线代码两种模式通用。"""
+    if r.timed_out:
+        return -1, f"超时\n{r.output}"
+    return r.code, r.output
+
+
+def ensure_container(env: Env) -> tuple[bool, str]:
+    """保证长驻容器存在且在跑。不存在就创建（并跑一次性修补），停了就 start。
+
+    幂等、随时可重入 —— WSL 死掉重启后容器只是 Exited，start 即恢复；
+    容器被删则重建 + 重跑修补（修补写在容器层，rm 后自然要重来）。
+    返回 (ok, note)。note 非空且 ok=True 时是要进 install_note 的提示。
+    """
+    if env.exec_mode != "docker":
+        return True, ""
+    code, out = sh(["docker", "inspect", "-f", "{{.State.Running}}",
+                    env.container_name], timeout=60)
+    if code == 0:
+        if out.strip().endswith("true"):
+            return True, ""
+        code2, out2 = sh(["docker", "start", env.container_name], timeout=180)
+        if code2 != 0:
+            return False, f"容器启动失败：{out2[-300:]}"
+        return True, ""
+    code, out = sh(["docker", "run", "-d", "--name", env.container_name,
+                    "-v", f"{env.repo_dir}:/testbed", "-w", "/testbed",
+                    "--memory", "2500m", "--memory-swap", "2500m",
+                    env.container_image, "sleep", "infinity"], timeout=600)
+    if code != 0:
+        return False, f"容器创建失败：{out[-300:]}"
+    return _container_fixups(env)
+
+
+def stop_container(env: Env) -> None:
+    """停容器（尽力而为）。逐实例 stop 是 8GB 机器上并发能开到 2 的前提。"""
+    if env.exec_mode == "docker" and env.container_name:
+        sh(["docker", "stop", "-t", "2", env.container_name], timeout=60)
+
+
+def _container_fixups(env: Env) -> tuple[bool, str]:
+    """新容器的一次性修补（幂等）：
+
+    1) 被测包统一转 editable —— requests 的镜像是非 editable 安装，agent 改
+       源码不生效；其余仓库本就是 -e .，重装无害。官方 judge 判分前会按 spec
+       重装一遍，判分语义不受影响。
+    2) chown -R 把 /testbed 归还宿主 uid —— 容器写的每个文件宿主都可删，
+       reset() / git clean 才可信。
+    """
+    import os as _os
+    pip = (f"{env.container_python} -m pip install -e . "
+           f"--no-deps --no-build-isolation -q")
+    code, out = sh(["docker", "exec", "-u", "0", "-w", "/testbed",
+                    env.container_name, "bash", "-c", pip], timeout=900)
+    note = "" if code == 0 else f"editable 修补失败（agent 的源码改动可能不生效）：{out[-200:]}"
+    sh(["docker", "exec", "-u", "0", env.container_name, "chown", "-R",
+        f"{_os.getuid()}:{_os.getgid()}", "/testbed"], timeout=600)
+    return True, note
+
+
+def _write_git_excludes(repo_dir: Path) -> None:
+    """工作树本地忽略清单（.git/info/exclude，不进仓库也不进 patch）：
+    两侧跑测试可能落下的缓存产物，一律既不脏 git status 也不进 diff。"""
+    ex = repo_dir / ".git" / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    wanted = ["__pycache__/", "*.pyc", ".pytest_cache/", ".hypothesis/",
+              "*.egg-info/", ".coverage", ".coverage.*"]
+    existing = ex.read_text(encoding="utf-8") if ex.exists() else ""
+    add = [w for w in wanted if w not in existing]
+    if add:
+        ex.write_text(existing.rstrip("\n") + "\n" + "\n".join(add) + "\n",
+                      encoding="utf-8")
 
 
 def read_requires_python(repo_dir: Path) -> str:
@@ -503,10 +724,12 @@ def discover_test_roots(repo_dir: Path) -> list[str]:
 # 一个和被测代码毫无关系的地方。按【由全到简】的顺序探一遍，用第一个能跑的。
 # 探测本身也是机械的、公开的：只跑 --collect-only，不看任何答案。
 FLAG_SETS = (
-    "-q -ra --color=no -p no:randomly",   # 现代 pytest：省 token、无颜色码、禁随机顺序
-    "-q -ra --color=no",                  # 没装 pytest-randomly
-    "-q -ra",                             # 老 pytest 不认 --color
-    "-q",                                 # 更老：连 -ra 都没有
+    # 现代 pytest：省 token、无颜色码、禁随机顺序、不落 .pytest_cache（容器模式
+    # 里缓存目录会脏工作树 —— 它虽然进不了 patch，但会让干净断言天天叫）
+    "-q -ra --color=no -p no:randomly -p no:cacheprovider",
+    "-q -ra --color=no -p no:cacheprovider",  # 没装 pytest-randomly
+    "-q -ra",                                 # 老 pytest 不认 --color / no:cacheprovider
+    "-q",                                     # 更老：连 -ra 都没有
 )
 
 
@@ -521,16 +744,21 @@ def derive_test_command(venv_py: str, test_roots: list[str],
     return f"{base} {' '.join(test_roots)}" if test_roots else base
 
 
-def probe_flags(venv_py: str, repo_dir: Path, test_roots: list[str]) -> tuple[str, str]:
+def probe_flags(venv_py: str, repo_dir: Path, test_roots: list[str],
+                runner=None) -> tuple[str, str]:
     """探出这套 pytest 认哪组参数。返回 (可用参数, 最后一次错误输出)。
 
     区分两种失败很重要：**参数不被认识**是我们自己造成的，**测试根本跑不起来**
     才是真的环境问题。不探测的话两者都表现为"收集失败"，会把前者记成后者。
+
+    runner(cmd, timeout) -> (code, output) 决定命令在哪跑：不传就在宿主
+    （venv 模式），docker 模式传一个进容器执行的 runner。
     """
+    run = runner or (lambda cmd, timeout=600: sh(cmd, cwd=repo_dir, timeout=timeout))
     last = ""
     for flags in FLAG_SETS:
         cmd = derive_test_command(venv_py, test_roots, flags) + " --collect-only"
-        code, out = sh(cmd, cwd=repo_dir, timeout=600)
+        code, out = run(cmd, 600)
         if code in (0, 5) or _collected_a_lot(out):
             return flags, ""
         last = out
@@ -582,12 +810,22 @@ def reset(env: Env) -> None:
 
 
 def capture_patch(env: Env) -> str:
-    """取 agent 的补丁。含未跟踪的新文件 —— 新增源文件也是修复的一部分。"""
+    """取 agent 的补丁。含未跟踪的新文件 —— 新增源文件也是修复的一部分。
+
+    末尾的 exclude pathspec 是 .git/info/exclude 之外的第二道防线：万一哪个
+    缓存产物越过了忽略清单（比如老 pytest 不认 no:cacheprovider），也不许它
+    混进交给判分的 patch。
+    """
     if env.repo_dir is None:
         return ""
     # 先把未跟踪文件加进索引（不提交），这样 diff 才看得见它们
     sh(["git", "add", "-A", "-N"], cwd=env.repo_dir)
-    _, diff = sh(["git", "diff"], cwd=env.repo_dir)
+    _, diff = sh(["git", "diff", "--", ".",
+                  ":(exclude,glob)**/__pycache__/**",
+                  ":(exclude,glob)**/*.pyc",
+                  ":(exclude,glob)**/.pytest_cache/**",
+                  ":(exclude,glob)**/.hypothesis/**",
+                  ":(exclude,glob)**/*.egg-info/**"], cwd=env.repo_dir)
     return diff
 
 

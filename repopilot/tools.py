@@ -208,10 +208,12 @@ class ToolKit:
         ok, reason = check_command(command)
         if not ok:
             return f"错误：{reason}"
-        proc = subprocess.run(command, shell=True, cwd=self.root,
-                              capture_output=True, text=True, timeout=CMD_TIMEOUT)
-        output = (proc.stdout + proc.stderr).strip()
-        return f"exit_code={proc.returncode}\n{output or '(无输出)'}"
+        r = self.ws.exec.run(command, cwd=self.root, timeout=CMD_TIMEOUT)
+        if r.timed_out:
+            partial = r.output.strip()
+            return (f"错误：命令执行超时（>{CMD_TIMEOUT}s）"
+                    + (f"\n超时前输出末尾：\n{partial[-1500:]}" if partial else ""))
+        return f"exit_code={r.code}\n{r.output.strip() or '(无输出)'}"
 
     def run_tests(self, project: str = "", scope: str = "") -> str:
         """跑 adapter 给定的测试命令。模型不许自己猜测试命令 —— 猜错一次烧一轮 token。
@@ -336,10 +338,8 @@ class ToolKit:
         if not cmd:
             return ("这个项目没有检测到 E2E 配置（playwright.config.* / cypress.config.*）。"
                     "如果要验证页面行为，用 browser_* 工具手动复现。")
-        proc = subprocess.run(cmd, shell=True, cwd=self.root, capture_output=True,
-                              text=True, timeout=CMD_TIMEOUT * 2)
-        out = (proc.stdout + proc.stderr)[-4000:]
-        return f"$ {cmd}\nexit_code={proc.returncode}\n{out}"
+        r = self.ws.exec.run(cmd, cwd=self.root, timeout=CMD_TIMEOUT * 2)
+        return f"$ {cmd}\nexit_code={r.code}\n{r.output[-4000:]}"
 
     # ======================================================== 浏览器
     @property

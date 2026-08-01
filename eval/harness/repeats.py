@@ -29,6 +29,8 @@ import json
 import statistics
 from pathlib import Path
 
+from .report import official_overlay
+
 
 def load_repeat(run_ids: list[str], runs_dir: Path) -> dict[str, list[dict]]:
     """读若干次重复运行，返回 instance_id → [每次的记录]。"""
@@ -47,6 +49,8 @@ def load_repeat(run_ids: list[str], runs_dir: Path) -> dict[str, list[dict]]:
                         rec["env_ok"] = data.get("ok")
                     else:
                         rec.update(data)
+            # 官方判分叠加层：与 report.load_rows 同一套主口径切换逻辑
+            official_overlay(p, rec)
             per_instance.setdefault(p.name, []).append(rec)
     return per_instance
 

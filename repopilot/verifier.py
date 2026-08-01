@@ -28,7 +28,6 @@
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass, field
 
 from .adapters.base import TestReport, ValidationStep, tail
@@ -89,28 +88,16 @@ def run_tests_in(ws, profile, command: str | None, cwd: str | None = None,
         return TestReport(exit_code=-1, tail="没有可用的测试命令", parsed=False)
 
     workdir = ws.root if cwd in (None, ".") else ws.root / cwd
-    try:
-        proc = subprocess.run(
-            command, shell=True, cwd=workdir,
-            capture_output=True, text=True, timeout=TEST_TIMEOUT,
-        )
-        output, code = proc.stdout + proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired as e:
+    r = ws.exec.run(command, cwd=workdir, timeout=TEST_TIMEOUT)
+    if r.timed_out:
         # 超时也要把已有输出交出去：超时前的输出往往正是卡住的原因
-        partial = _decode(e.stdout) + _decode(e.stderr)
         return TestReport(exit_code=-1, errors=1, parsed=False,
-                          tail=f"测试超时（>{TEST_TIMEOUT}s）\n{tail(partial)}")
-    except OSError as e:
+                          tail=f"测试超时（>{TEST_TIMEOUT}s）\n{tail(r.output)}")
+    if r.code == -1:
         return TestReport(exit_code=-1, errors=1, parsed=False,
-                          tail=f"测试命令无法启动：{e}")
+                          tail=f"测试{r.output}")
 
-    return (adapter or profile).parse_test_output(output, code)
-
-
-def _decode(raw) -> str:
-    if raw is None:
-        return ""
-    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    return (adapter or profile).parse_test_output(r.output, r.code)
 
 
 def compare(base: TestReport, after: TestReport) -> dict:
@@ -221,26 +208,23 @@ def run_validation(ws, profile, only: list[str] | None = None,
     report = ValidationReport()
 
     for step in steps:
-        result = _run_step(step, workdir)
+        result = _run_step(ws.exec, step, workdir)
         report.steps.append(result)
         if not result.ok:
             break
     return report
 
 
-def _run_step(step: ValidationStep, workdir) -> StepResult:
-    try:
-        proc = subprocess.run(step.command, shell=True, cwd=workdir,
-                              capture_output=True, text=True,
-                              timeout=TEST_TIMEOUT if step.name == "test" else CMD_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return StepResult(step.name, step.command, -1, f"超时（>{CMD_TIMEOUT}s）")
-    except OSError as e:
-        return StepResult(step.name, step.command, -1, str(e))
+def _run_step(execu, step: ValidationStep, workdir) -> StepResult:
+    limit = TEST_TIMEOUT if step.name == "test" else CMD_TIMEOUT
+    r = execu.run(step.command, cwd=workdir, timeout=limit)
+    if r.timed_out:
+        return StepResult(step.name, step.command, -1, f"超时（>{limit}s）")
+    if r.code == -1:
+        return StepResult(step.name, step.command, -1, r.output)
 
-    output = proc.stdout + proc.stderr
-    missing = proc.returncode == 127 or any(sig in output for sig in _MISSING_TOOL)
-    if not step.required and proc.returncode != 0 and missing:
-        return StepResult(step.name, step.command, proc.returncode, output,
+    missing = r.code == 127 or any(sig in r.output for sig in _MISSING_TOOL)
+    if not step.required and r.code != 0 and missing:
+        return StepResult(step.name, step.command, r.code, r.output,
                           skipped=True, skip_reason="工具未安装")
-    return StepResult(step.name, step.command, proc.returncode, output)
+    return StepResult(step.name, step.command, r.code, r.output)

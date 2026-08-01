@@ -99,7 +99,7 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
           max_attempts: int | None = None,
           with_runtime: bool = False, scenario_path: str | None = None,
           ignore_env: bool = False, budget: Budget | None = None,
-          result_path: str | None = None) -> int:
+          result_path: str | None = None, executor=None) -> int:
     """跑完整个闭环，返回退出码（0=成功且审查通过）。
 
     budget 是这次运行被允许花的全部资源（见 budget.py）。不传就用默认值 ——
@@ -117,6 +117,9 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
 
     # ---- 准备工作区（门禁：git 仓库 + 工作区干净）----
     ws = Workspace.prepare(repo, CLONES_DIR)
+    if executor is not None:
+        # 评测容器模式：命令进官方镜像容器执行，git/文件仍在宿主（bind-mount 同树）
+        ws.exec = executor
     ws.ensure_clean()
     profile = detect(ws.root, test_cmd)
     if not profile.test_cmd:

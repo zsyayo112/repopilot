@@ -38,8 +38,9 @@ DATASET = "princeton-nlp/SWE-bench_Verified"
 PY = sys.executable
 
 
-def dev_instance_ids() -> list[str]:
-    return json.loads((EVAL_DIR / "splits" / "verified_dev.json").read_text())["instance_ids"]
+def split_instance_ids(split: str) -> list[str]:
+    return json.loads((EVAL_DIR / "splits" / f"verified_{split}.json")
+                      .read_text())["instance_ids"]
 
 
 def build_predictions(run_id: str) -> Path:
@@ -60,7 +61,7 @@ def build_predictions(run_id: str) -> Path:
     out.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
                    encoding="utf-8")
     print(f"[{run_id}] {len(rows)} 份补丁 → {out}")
-    return out
+    return out, [r["instance_id"] for r in rows]
 
 
 def run_official(predictions: str, run_id: str, ids: list[str], workers: int) -> None:
@@ -104,6 +105,35 @@ def collect(run_id: str) -> dict:
     return out
 
 
+def collect_gold(ids: list[str], run_id: str) -> None:
+    """gold 校准结果按实例落盘到 eval/envs/<iid>/official_gold.json。
+
+    这是 report/repeats 的 certifiable 门以后读的东西：可判性从此是
+    【官方判分器的测量结果】,不是本地 venv 的,更不是 commit message 里的论断。
+    """
+    reports = sorted(OFFICIAL_DIR.glob(f"*{run_id}*.json"),
+                     key=lambda p: p.stat().st_mtime)
+    if not reports:
+        print(f"[{run_id}] 找不到官方 gold 报告 —— 校准没跑完,看上面的日志")
+        return
+    rep = json.loads(reports[-1].read_text())
+    resolved = set(rep.get("resolved_ids") or [])
+    judged = set(rep.get("submitted_ids") or []) - set(rep.get("error_ids") or [])
+    ok = 0
+    for iid in ids:
+        verdict = {"gold_ok": iid in resolved, "judged": iid in judged,
+                   "judge": "swebench-official-docker", "report": reports[-1].name}
+        ok += verdict["gold_ok"]
+        d = EVAL_DIR / "envs" / iid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "official_gold.json").write_text(
+            json.dumps(verdict, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not verdict["gold_ok"]:
+            print(f"  ✗ gold 不过：{iid}（官方判分器在这条上不可信,报告单列）")
+    print(f"[{run_id}] 官方 gold 校准：{ok}/{len(ids)} 过,"
+          f"结果已写入 eval/envs/<iid>/official_gold.json")
+
+
 def diff_table(run_id: str, official: dict) -> None:
     """本地判分 vs 官方判分的分歧表。分歧 = 本地判分器误差的直接测量。"""
     print(f"\n== {run_id}: 本地 vs 官方 ==")
@@ -128,16 +158,23 @@ def main():
                     help="官方 gold 校准：容器里跑标准答案,应当全过")
     ap.add_argument("--workers", type=int, default=2,
                     help="并发判分数。镜像各自独立,瓶颈在内存,8GB 机器别超过 2")
+    ap.add_argument("--split", default="dev", choices=("dev", "test", "holdout"),
+                    help="--gold 校准哪个划分（重判不需要它：实例清单从 run 目录推导）")
     args = ap.parse_args()
-    ids = dev_instance_ids()
 
     if args.gold:
         # 'gold' 是官方 harness 的保留字：用数据集自带的标准答案当预测
-        run_official("gold", "gold-calibration", ids, args.workers)
+        ids = split_instance_ids(args.split)
+        rid = f"gold-calibration-{args.split}"
+        run_official("gold", rid, ids, args.workers)
+        collect_gold(ids, rid)
         return
 
     for rid in args.run_ids:
-        preds = build_predictions(rid)
+        preds, ids = build_predictions(rid)
+        if not ids:
+            print(f"[{rid}] 没有补丁可判,跳过")
+            continue
         run_official(str(preds), rid, ids, args.workers)
         diff_table(rid, collect(rid))
 

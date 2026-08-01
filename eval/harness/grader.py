@@ -60,6 +60,7 @@ class GradeResult:
     p2p_bad: list[str] = field(default_factory=list)
     gold_ok: bool | None = None          # None = 还没校准
     gold_note: str = ""
+    judge: str = ""                      # 判分执行环境：local-container / local-venv
     audit: dict = field(default_factory=dict)
     leak_findings: list[dict] = field(default_factory=list)
 
@@ -99,8 +100,9 @@ def grade_patch(env: Env, secret: SecretInstance, patch: str, *,
         return res
 
     res.f2p_ok, res.p2p_ok, res.f2p_bad, res.p2p_bad, note = _run_official(
-        env.venv_py, repo_dir, secret, timeout)
+        env, repo_dir, secret, timeout)
     res.resolved = bool(res.f2p_ok and res.p2p_ok)
+    res.judge = "local-container" if env.exec_mode == "docker" else "local-venv"
     res.note = res.note or note
     reset(env)
     return res
@@ -127,9 +129,10 @@ def calibrate_gold(env: Env, secret: SecretInstance, *, timeout: int = 1800) -> 
         return {"gold_ok": False, "gold_note": "test_patch 打不上"}
 
     f2p_ok, p2p_ok, f2p_bad, p2p_bad, note = _run_official(
-        env.venv_py, repo_dir, secret, timeout)
+        env, repo_dir, secret, timeout)
     reset(env)
-    return {"gold_ok": bool(f2p_ok and p2p_ok), "gold_note": note[:300]}
+    return {"gold_ok": bool(f2p_ok and p2p_ok), "gold_note": note[:300],
+            "judge": "local-container" if env.exec_mode == "docker" else "local-venv"}
 
 
 # 泄露扫描分两级，因为它们说的是两件完全不同的事。
@@ -174,16 +177,27 @@ def _apply_test_patch(repo_dir: Path, secret: SecretInstance) -> bool:
     return applied
 
 
-def _run_official(venv_py: str, repo_dir: Path, secret: SecretInstance,
+def _run_official(env: Env, repo_dir: Path, secret: SecretInstance,
                   timeout: int):
-    """跑整个测试文件，解析 -rA 摘要，再逐个比对 F2P / P2P。"""
+    """跑整个测试文件，解析 -rA 摘要，再逐个比对 F2P / P2P。
+
+    docker 模式下 pytest 在官方镜像容器里跑（era-correct 环境）；
+    git 打补丁/还原永远在宿主 —— 两侧本来就是同一棵 bind-mount 的树。
+    """
     ids = [*secret.fail_to_pass, *secret.pass_to_pass]
     files = sorted({i.split("::")[0] for i in ids})
     if not files:
         return False, False, [], [], "数据集里没有 F2P/P2P，无法判分"
 
-    _, out = sh([venv_py, "-m", "pytest", "-rA", "--color=no", *files],
-                cwd=repo_dir, timeout=timeout)
+    if env.exec_mode == "docker":
+        from repopilot.execenv import DockerExecutor
+        ex = DockerExecutor(env.container_name, repo_dir, env.container_python)
+        r = ex.run(f"{env.container_python} -m pytest -rA --color=no "
+                   + " ".join(files), cwd=repo_dir, timeout=timeout)
+        out = r.output
+    else:
+        _, out = sh([env.venv_py, "-m", "pytest", "-rA", "--color=no", *files],
+                    cwd=repo_dir, timeout=timeout)
 
     status: dict[str, str] = {}
     for line in out.splitlines():
