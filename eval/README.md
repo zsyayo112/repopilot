@@ -347,6 +347,31 @@ werkzeug 3.x，第一行就 `AttributeError`。
 没装 `uv` 会退回当前解释器和今天的依赖 —— 但这条退化路径会写进
 `env.json` 的 `install_note` 并出现在报告里，而不是默默发生。
 
+### dev 划分的实测结果（推理开始前，与 agent 表现无关）
+
+| | 条数 | |
+|---|---:|---|
+| 冻结分母 | **15** | 不许动 |
+| 环境失败 | 4 | requests-1724（pytest 2.4.2 跑不了 py3.9）、sphinx-7910/8120（uv 的独立 CPython 不带 `_testcapi`）、xarray-3151（日期约束无解，退回今天的 numpy，`np.unicode_` 已删） |
+| gold 也过不了 | 2 | requests-6028、pytest-5631 |
+| **gold 可判定** | **9** | 判分器在这 9 条上可信 |
+
+环境就绪率从 4/15 爬到 11/15，中间修掉的五个 bug **全是我自己造的**，
+形状完全一样：**对仓库做假设，而不是读它自己声明了什么**。留档在这里，
+因为它是这类线束最典型的失效模式：
+
+| bug | 代价 |
+|---|---|
+| `re.match(r"^(setuptools\|wheel)\b", "setuptools-scm[toml]")` **是匹配的**（`-` 是非单词字符），于是自己的过滤器剔掉了 `setuptools-scm` | 3 条 pytest 挂在 `No module named '_pytest._version'` |
+| 关掉构建隔离后没装 `[build-system] requires` | 构建"成功"但产物不全 |
+| 现代 setuptools 留在了运行环境里，`import pkg_resources` 抛弃用警告 × 仓库的 `filterwarnings = error` | xarray / sphinx 收集阶段崩 |
+| extras 的字典写法 `"testing": [...]`（冒号不是等号）没认 | pytest 少装 hypothesis |
+| 部分收集失败一票否决 | 丢掉一条收集成功 1989 个测试的实例 |
+
+最后一条最值得记：**我的筛选标准比判分本身还严**。判分只跑 F2P/P2P 指定的
+那几个文件，而我因为两个无关文件 import 失败就扔掉整条实例 ——
+用一个比判分更严的标准去筛样本，白白缩小可用分母。
+
 ---
 
 ## 10. 缓存策略：什么能复用，什么绝对不能
