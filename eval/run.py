@@ -94,9 +94,11 @@ def cmd_prepare(args):
     """环境层。这一层可以缓存、可以跨 agent 版本复用，因为它不含任何 agent 产出。"""
     for inst in _instances(args.split, args.only):
         log(f"=== {inst.instance_id} ===")
-        env = prepare(inst, force=args.force)
+        env = prepare(inst, force=args.force, baseline_timeout=args.baseline_timeout)
         log(f"  {'✓ 就绪' if env.ok else '✗ ' + env.error[:120]}"
-            + (f"  测试范围：{env.test_roots or '全量'}" if env.ok else ""))
+            + (f"  测试范围：{env.test_roots or '全量'}"
+               f"  全量耗时 {env.baseline_secs}s"
+               f"{'（未跑完，仅记录）' if env.baseline_timed_out else ''}" if env.ok else ""))
 
 
 def cmd_calibrate(args):
@@ -271,6 +273,8 @@ def main():
         c.add_argument("--only", nargs="*")
         c.add_argument("--force", action="store_true")
         c.add_argument("--timeout", type=int, default=1800)
+        c.add_argument("--baseline-timeout", type=int, default=900,
+                       help="量全量套件耗时的上限。超了只记录，不判死实例")
 
     i = sub.add_parser("infer", help="推理（不接触任何答案）")
     i.add_argument("--split", default="dev", choices=("dev", "test", "holdout"))

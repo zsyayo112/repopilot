@@ -111,11 +111,13 @@ class Env:
     install_note: str = ""         # 依赖是怎么装上的（哪个 extras、有没有降级）
     test_cmd: str = ""
     test_roots: list[str] = field(default_factory=list)
-    baseline_exit: int | None = None
+    collect_exit: int | None = None   # 闸门：测试收集得起来吗
+    baseline_exit: int | None = None  # 度量：全量跑完是什么结果
     # 跑一遍全量测试要多久。这是"去掉 test_patch 泄露"的直接代价：范围从
-    # 几个文件变成整个测试目录，seaborn 这类项目一轮就要几分钟 —— 而 agent
-    # 每轮都要跑。慢到超过 agent 的测试超时，这条实例就废了，所以要量出来。
+    # 几个文件变成整个测试目录，seaborn 这类项目一轮就要 8 分钟 —— 而 agent
+    # 每轮都要跑一次。这个数直接决定单实例耗时和 --test-timeout 该给多大。
     baseline_secs: float = 0.0
+    baseline_timed_out: bool = False
     prepared_at: float = 0.0
     ok: bool = False
     error: str = ""
@@ -134,7 +136,8 @@ def _stamp(instance_id: str) -> Path:
     return env_dir(instance_id) / "env.json"
 
 
-def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False) -> Env:
+def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False,
+            baseline_timeout: int = 900) -> Env:
     """克隆 → checkout base_commit → 建 venv 装依赖 → 探测测试命令 → 跑一次基线。
 
     做过一次就把结果盖章存进 env.json，后续运行直接读 —— 这是最值钱的一层
@@ -198,15 +201,27 @@ def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False) -
     env.test_roots = discover_test_roots(repo_dir)
     env.test_cmd = derive_test_command(str(venv_py), env.test_roots)
 
-    # -- 4. 基线闸门：这个环境到底跑不跑得动测试 --
-    log("  跑基线…")
+    # -- 4. 环境闸门：只证明"跑得动"，不证明"跑得快" --
+    #
+    # 闸门用 --collect-only，因为它证明的正好是"环境就绪"该证明的那件事：
+    # 依赖装上了、import 得进去、测试能被发现。
+    # 拿跑完整套件当闸门会把【慢】和【坏】混为一谈 —— seaborn 一轮要 8 分钟，
+    # 它不是坏，它只是慢，而慢是一个该被记录的数字，不是一个该被淘汰的理由。
+    log("  收集测试（环境闸门）…")
+    code, out = sh(f"{env.test_cmd} --collect-only -q", cwd=repo_dir, timeout=600)
+    if code not in (0, 5):     # 5 = 一个测试都没收集到，也算跑得动但要记下来
+        return _fail(env, stamp, f"测试收集失败 exit={code}：{out[-400:]}")
+    env.collect_exit = code
+
+    # -- 5. 量一下全量套件要多久。这是【度量】不是【闸门】：超时不判死。 --
+    # 为什么值得单独量：agent 每一轮都要跑一次测试，这个数直接决定单实例耗时，
+    # 也决定 --test-timeout 该给多大。测不出来只说明它很慢，不说明它坏了。
+    log("  量基线耗时…")
     t0 = time.time()
-    code, out = sh(env.test_cmd, cwd=repo_dir, timeout=900)
+    code, out = sh(env.test_cmd, cwd=repo_dir, timeout=baseline_timeout)
     env.baseline_secs = round(time.time() - t0, 1)
     env.baseline_exit = code
-    # 0=全过 1=有失败，都算"跑得动"；2/4=收集阶段就崩=环境不行
-    if code not in (0, 1):
-        return _fail(env, stamp, f"基线不可跑 exit={code}：{out[-400:]}")
+    env.baseline_timed_out = code == -1
 
     env.ok = True
     _save(env, stamp)
