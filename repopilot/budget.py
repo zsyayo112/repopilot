@@ -80,6 +80,21 @@ class Budget:
     # 实测：flask 这类小仓库跑完一个实例约 26 万计费 token（其中九成命中缓存）。
     token_budget: int = 600_000
 
+    # -- 成本（美元）--
+    # 【为什么要有第二种结算单位】token 口径把缓存命中按全价记账，而首轮实测
+    # 92% 的计费 token 是缓存命中，价格只有未命中的 1/4（0.07 vs 0.27）。
+    # 结果就是：预算在一个几乎不要钱的资源上掐流量 —— 11 条实例里 7 条被
+    # 600k 上限停下时，实际只花了 6 分钱。更糟的是它对变体还不公平：前缀越
+    # 稳定的 agent 命中率越高，按 token 计价恰好把这项真实的效率优势抹掉。
+    # 这个文件开头论证预算存在的那句话 ——"成功率高可能只是买得更多"——
+    # 里的"买"，单位本来就是钱。
+    #
+    # 设了这个字段、且模型在价格表里，预算就按钱结算，token_budget 退出裁决
+    # （一次运行只有一种货币，双重计量等于两个都说不清）。设了但模型没价格
+    # 属于配置错误，由调用方（eval/run.py）在入口直接拒绝，而不是这里悄悄
+    # 退回 token 口径 —— 悄悄换单位比报错糟得多。
+    cost_budget_usd: float | None = None
+
     # -- 时间 --
     instance_timeout: int = 1800            # 单实例墙钟上限（秒），由外层 harness 执行
 
@@ -102,9 +117,20 @@ class Budget:
         """派生一个只改了指定字段的新预算 —— 消融实验就是靠它保证"只差这一项"。"""
         return replace(self, **overrides)
 
+    def metered_in_usd(self) -> bool:
+        """预算按不按钱结算。两件事同时成立才算：设了钱数、模型有价格表。"""
+        return self.cost_budget_usd is not None and self.model in PRICING
+
     def fingerprint(self) -> str:
         """预算指纹。两次运行的指纹不同 = 结果不可直接比较，报告里必须写明。"""
-        blob = json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
+        d = self.to_dict()
+        if self.metered_in_usd():
+            # 按钱结算时，价格表是预算语义的一部分：命中价从 0.07 变 0.10，
+            # 同一个 $0.25 买到的轮数就不一样了。把生效价格并进指纹，价一变
+            # 指纹就变，两次运行自动不可比。token 口径的运行不受价格影响，
+            # 指纹也就不跟着价格变 —— 指纹只收"影响行为的东西"。
+            d["pricing"] = PRICING[self.model]
+        blob = json.dumps(d, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def describe(self) -> str:
@@ -113,10 +139,12 @@ class Budget:
                                 ("explorer", self.allow_explorer),
                                 ("reviewer", self.allow_reviewer),
                                 ("halting", self.allow_halting_policy)) if on]
+        money = (f"$≤{self.cost_budget_usd}（按钱结算，缓存命中按实价）"
+                 if self.metered_in_usd() else f"tokens≤{self.token_budget:,}")
         return (f"{self.model} T={self.temperature} | "
                 f"turns≤{self.max_turns} tools≤{self.max_tool_calls} "
                 f"attempts≤{self.max_fix_attempts} tests≤{self.max_test_runs} | "
-                f"tokens≤{self.token_budget:,} | {self.instance_timeout}s | "
+                f"{money} | {self.instance_timeout}s | "
                 f"能力：{'+'.join(caps) or '无'}")
 
 
@@ -180,14 +208,29 @@ class Ledger:
         return time.time() - self.started_at
 
     def pressure(self) -> float:
-        """token 用掉了几成。0.8 是"禁止大范围探索"的触发线（见 halting.py）。"""
+        """预算用掉了几成。0.8 是"禁止大范围探索"的触发线（见 halting.py）。
+
+        分子分母跟着结算单位走：按钱结算就是 花的钱/钱的预算。单位换了
+        触发线不换 —— 0.8 的含义始终是"还剩两成，省着花"。
+        """
+        if self.budget.metered_in_usd():
+            if self.budget.cost_budget_usd <= 0:
+                return 0.0
+            return self.cost_usd() / self.budget.cost_budget_usd
         if self.budget.token_budget <= 0:
             return 0.0
         return self.total_tokens / self.budget.token_budget
 
     def exhausted(self) -> str | None:
         """超支了吗？返回超支原因（可直接当失败分类码），没超返回 None。"""
-        if self.total_tokens >= self.budget.token_budget:
+        if self.budget.metered_in_usd():
+            # 按钱结算：缓存命中按 0.07 而不是 0.27 记账。token_budget 在这个
+            # 口径下【不再裁决】—— 一次运行只有一种货币。失控由别的闸兜着：
+            # 每次调用都花钱且钱只增不减，加上 max_turns / max_tool_calls /
+            # instance_timeout 三道独立的闸。
+            if self.cost_usd() >= self.budget.cost_budget_usd:
+                return "COST_LIMIT"
+        elif self.total_tokens >= self.budget.token_budget:
             return "TOKEN_LIMIT"
         if self.tool_calls >= self.budget.max_tool_calls:
             return "TOOL_CALL_LIMIT"

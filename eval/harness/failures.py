@@ -32,6 +32,7 @@ TAXONOMY = [
     ("HARNESS_ERROR", "评测线束自己崩了，与 agent 无关"),
     ("TIMEOUT", "单实例墙钟超时"),
     ("TOKEN_LIMIT", "token 预算耗尽"),
+    ("COST_LIMIT", "成本预算耗尽（该运行按钱结算，缓存命中按实价计）"),
     ("TOOL_CALL_LIMIT", "工具调用次数耗尽"),
     # 这一类【必须】和补丁写错分开：两者都表现为 git apply 失败，但截断是
     # 【我们的预算】掐断了它，不是它自己的能力问题。混在一起会让评测者
@@ -54,6 +55,7 @@ LABELS = dict(TAXONOMY)
 _HALT_TO_CATEGORY = {
     "TIMEOUT": "TIMEOUT",
     "TOKEN_LIMIT": "TOKEN_LIMIT",
+    "COST_LIMIT": "COST_LIMIT",
     "TOOL_CALL_LIMIT": "TOOL_CALL_LIMIT",
     "ENVIRONMENT_ERROR": "ENVIRONMENT_ERROR",
     "HARNESS_ERROR": "HARNESS_ERROR",
@@ -88,7 +90,7 @@ def classify(row: dict) -> str:
     halt = row.get("halt_code") or ""
     if halt in ("HARNESS_ERROR", "NO_RESULT"):
         return "HARNESS_ERROR"
-    if halt in _HALT_TO_CATEGORY and halt in ("TIMEOUT", "TOKEN_LIMIT",
+    if halt in _HALT_TO_CATEGORY and halt in ("TIMEOUT", "TOKEN_LIMIT", "COST_LIMIT",
                                               "TOOL_CALL_LIMIT", "ISSUE_NOT_REPRODUCED"):
         return _HALT_TO_CATEGORY[halt]
 

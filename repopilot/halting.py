@@ -175,8 +175,10 @@ class HaltingPolicy:
 
         if not self.narrowed and ledger.pressure() >= TOKEN_PRESSURE_LINE:
             self.narrowed = True
+            # pressure() 的分母跟着结算单位走（token 或钱），这里的措辞也跟着
+            # 中性化。代码 TOKEN_PRESSURE 保持不变 —— 它已经进了历史轨迹。
             return Decision("narrow", "TOKEN_PRESSURE",
-                            f"token 已用掉 {ledger.pressure():.0%}，"
+                            f"预算已用掉 {ledger.pressure():.0%}，"
                             "关闭大范围探索，把剩余额度留给收尾。")
 
         return Decision("continue")

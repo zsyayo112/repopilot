@@ -131,15 +131,21 @@ def cmd_infer(args):
 
     from harness.inference import VARIANTS, budget_for, run_one
 
-    from repopilot.budget import Budget
+    from repopilot.budget import PRICING, Budget
 
     if args.variant not in VARIANTS:
         raise SystemExit(f"未知变体 {args.variant}，可选：{', '.join(VARIANTS)}")
+    if args.cost_budget is not None and args.model not in PRICING:
+        # 在入口就拒绝，而不是让 Budget 悄悄退回 token 口径 ——
+        # 悄悄换结算单位比报错糟得多：跑完才发现预算根本没按说的那样生效。
+        raise SystemExit(f"--cost-budget 需要 {args.model} 在价格表里（repopilot/budget.py "
+                         f"PRICING）。先加价格，或者去掉这个参数改用 --token-budget。")
 
     insts = _instances(args.split, args.only)
     base = Budget(model=args.model, token_budget=args.token_budget,
                   max_tool_calls=args.max_tool_calls,
-                  instance_timeout=args.timeout)
+                  instance_timeout=args.timeout,
+                  cost_budget_usd=args.cost_budget)
     budget = budget_for(args.variant, base)
 
     run_dir = RUNS_DIR / args.run_id
@@ -185,6 +191,28 @@ def cmd_infer(args):
         log(f"  → halt={res.get('halt_code') or '正常'} "
             f"patch={res.get('patch_bytes', 0)}B "
             f"tokens={led.get('total_tokens', 0)} {res.get('wall_secs')}s")
+
+
+def _child_cmd(args, instance_id: str) -> list[str]:
+    """并发模式下单条实例子进程的完整命令行。
+
+    单独拎成函数是因为它出过一类隐蔽 bug 的雏形：父进程加了新预算参数、
+    子进程命令行没跟上 —— 父进程按新口径写 manifest，子进程按默认值跑，
+    两边都不报错，跑完的数字却不属于任何一份配置。拎出来才测得到。
+    """
+    cmd = [sys.executable, str(Path(__file__).resolve()), "infer",
+           "--split", args.split, "--variant", args.variant,
+           "--run-id", args.run_id, "--only", instance_id,
+           "--model", args.model, "--token-budget", str(args.token_budget),
+           "--max-tool-calls", str(args.max_tool_calls),
+           "--timeout", str(args.timeout),
+           "--test-timeout", str(args.test_timeout), "--workers", "1",
+           "--child"]
+    if args.cost_budget is not None:
+        cmd += ["--cost-budget", str(args.cost_budget)]
+    if args.force:
+        cmd.append("--force")
+    return cmd
 
 
 def _kill_group(proc, grace: float = 10.0) -> None:
@@ -278,16 +306,7 @@ def _infer_parallel(args, insts, run_dir):
     def one(inst):
         out_dir = run_dir / inst.instance_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        cmd = [sys.executable, str(Path(__file__).resolve()), "infer",
-               "--split", args.split, "--variant", args.variant,
-               "--run-id", args.run_id, "--only", inst.instance_id,
-               "--model", args.model, "--token-budget", str(args.token_budget),
-               "--max-tool-calls", str(args.max_tool_calls),
-               "--timeout", str(args.timeout),
-               "--test-timeout", str(args.test_timeout), "--workers", "1",
-               "--child"]
-        if args.force:
-            cmd.append("--force")
+        cmd = _child_cmd(args, inst.instance_id)
         with (out_dir / "infer.log").open("w", encoding="utf-8") as f:
             # start_new_session：把子进程放进它自己的进程组。超时要杀的是
             # 【整棵树】—— agent 会派 pytest 出去，只杀直接子进程会留下一地
@@ -422,6 +441,12 @@ def main():
     i.add_argument("--force", action="store_true")
     i.add_argument("--model", default="deepseek-chat")
     i.add_argument("--token-budget", type=int, default=600_000)
+    i.add_argument("--cost-budget", type=float, default=None,
+                   help="成本预算（美元）。设了它预算就按钱结算：缓存命中按实价 "
+                        "（deepseek 0.07/M）而不是全价（0.27/M）记账，token_budget "
+                        "退出裁决。首轮实测 92%% 的计费 token 是缓存命中 —— token "
+                        "口径等于在一个几乎不要钱的资源上掐流量。要求模型在 "
+                        "PRICING 价格表里，否则入口直接拒绝")
     i.add_argument("--max-tool-calls", type=int, default=100)
     i.add_argument("--timeout", type=int, default=1800)
     i.add_argument("--test-timeout", type=int, default=900,
