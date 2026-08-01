@@ -144,14 +144,22 @@ def cmd_infer(args):
 
     run_dir = RUNS_DIR / args.run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    mani = manifest_mod.build(
-        run_id=args.run_id, split=args.split,
-        instance_ids=[i.instance_id for i in insts], budget=budget,
-        variant=args.variant, dataset=dataset.dataset_info(), notes=args.notes)
-    manifest_mod.write(run_dir, mani)
-    log(f"manifest 已冻结：{run_dir/'manifest.json'}")
-    print(f"  agent={mani['agent_commit']} prompt={mani['prompt_hash']} "
-          f"tools={mani['tool_schema_hash']} budget={mani['budget_fingerprint']}")
+    # 子进程【不写】manifest。它带的是 --only 一条实例，实例清单校验和当然和
+    # 整批不同，于是不可变守卫会（正确地）把它拦下。子进程是同一次运行的一个
+    # 切片，不是另一次实验 —— 权威 manifest 由父进程写一次。
+    # 守卫本身不放松：它挡的是"同一个 run_id 跑两套不同配置"，那条依然成立。
+    if not args.child:
+        mani = manifest_mod.build(
+            run_id=args.run_id, split=args.split,
+            instance_ids=[i.instance_id for i in insts], budget=budget,
+            variant=args.variant, dataset=dataset.dataset_info(), notes=args.notes)
+        manifest_mod.write(run_dir, mani)
+        log(f"manifest 已冻结：{run_dir/'manifest.json'}")
+        print(f"  agent={mani['agent_commit']} prompt={mani['prompt_hash']} "
+              f"tools={mani['tool_schema_hash']} budget={mani['budget_fingerprint']}")
+
+    if args.workers > 1:
+        return _infer_parallel(args, insts, run_dir)
 
     for inst in insts:
         out_dir = run_dir / inst.instance_id
@@ -177,6 +185,61 @@ def cmd_infer(args):
         log(f"  → halt={res.get('halt_code') or '正常'} "
             f"patch={res.get('patch_bytes', 0)}B "
             f"tokens={led.get('total_tokens', 0)} {res.get('wall_secs')}s")
+
+
+def _infer_parallel(args, insts, run_dir):
+    """按【实例】并发。每个实例一个子进程，输出各自落盘。
+
+    【为什么并发是安全的】每个实例有自己的 venv 和工作树，彼此之间没有共享
+    状态。真正不能并发的是**同一实例的不同变体** —— 它们共用同一个工作树，
+    而每次推理前后都要把工作树复位。所以并发只切实例这一维，
+    变体之间靠"分开跑 infer"天然串行。
+
+    【为什么用子进程而不是线程】solve() 会往 stdout 打一大片人看的过程输出。
+    多线程会把几个实例的输出搅在一起，事后没法读。子进程各自重定向到
+    <实例>/infer.log，既隔离了输出，也隔离了崩溃。
+
+    【为什么默认并发度这么低】瓶颈是内存不是 CPU：本机 12 核但只有 7GB，
+    而 seaborn 单次 pytest 峰值 1.4GB。开满核会 OOM，OOM 出来的失败会被
+    记成实例失败 —— 又是一次"评测者自己造成的失败记到被测方案头上"。
+    """
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+
+    pending = [i for i in insts
+               if args.force or not (run_dir / i.instance_id / "inference.json").exists()]
+    skipped = len(insts) - len(pending)
+    if skipped:
+        log(f"{skipped} 条已跑过，跳过（--force 可重跑）")
+    log(f"并发 {args.workers} 跑 {len(pending)} 条")
+
+    def one(inst):
+        out_dir = run_dir / inst.instance_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [sys.executable, str(Path(__file__).resolve()), "infer",
+               "--split", args.split, "--variant", args.variant,
+               "--run-id", args.run_id, "--only", inst.instance_id,
+               "--model", args.model, "--token-budget", str(args.token_budget),
+               "--max-tool-calls", str(args.max_tool_calls),
+               "--timeout", str(args.timeout),
+               "--test-timeout", str(args.test_timeout), "--workers", "1",
+               "--child"]
+        if args.force:
+            cmd.append("--force")
+        with (out_dir / "infer.log").open("w", encoding="utf-8") as f:
+            code = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
+        res = out_dir / "inference.json"
+        if res.exists():
+            d = json.loads(res.read_text())
+            return (f"{inst.instance_id}: halt={d.get('halt_code') or '正常'} "
+                    f"patch={d.get('patch_bytes', 0)}B "
+                    f"tokens={(d.get('ledger') or {}).get('total_tokens', 0)} "
+                    f"{d.get('wall_secs')}s")
+        return f"{inst.instance_id}: 子进程 exit={code} 且没有结果，见 infer.log"
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for line in pool.map(one, pending):
+            log("  → " + line)
 
 
 def cmd_grade(args):
@@ -288,6 +351,12 @@ def main():
     i.add_argument("--timeout", type=int, default=1800)
     i.add_argument("--test-timeout", type=int, default=900,
                    help="agent 单次跑测试的超时（秒）。全量套件比 scope 过的慢得多")
+    i.add_argument("--child", action="store_true",
+                   help="内部使用：由并发启动器设置，表示「我是整批里的一个切片」，"
+                        "因此不重写 manifest（权威 manifest 由父进程写一次）")
+    i.add_argument("--workers", type=int, default=1,
+                   help="并发跑几个实例。瓶颈是内存不是 CPU（seaborn 单次 pytest "
+                        "峰值 1.4GB），本机 7GB 内存建议不超过 3")
     i.add_argument("--notes", default="")
 
     g = sub.add_parser("grade", help="判分（独立进程，此时才载入答案）")
