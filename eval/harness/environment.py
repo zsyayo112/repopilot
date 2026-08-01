@@ -565,6 +565,18 @@ def reset(env: Env) -> None:
     """
     if env.repo_dir is None:
         return
+    # 【`git reset` 这一步不能少，少了它这个函数就是坏的】
+    # capture_patch() 用 `git add -A -N` 把未跟踪文件加进索引（不这样
+    # `git diff` 看不见新建文件）。而：
+    #     git clean -fd      不删【已进索引】的文件
+    #     git checkout -- .  又把它从索引恢复出来
+    # 三条命令各自都对，组合起来留下一个谁也删不掉的文件。
+    # 实测后果不止是脏：dev sweep 里 `tmp/test_repro.py` 从 full 变体活到了
+    # 后面每一个变体，让 no-reviewer / no-explorer 的干净门禁直接崩掉，
+    # 还被当成 baseline-a 的"补丁"交上去判分 —— 判分报
+    # `already exists in working directory`，一条实例就这么废了。
+    # **跨变体污染正是这个函数存在的唯一理由，而它自己漏了一步。**
+    sh(["git", "reset", "-q"], cwd=env.repo_dir)
     sh(["git", "checkout", "-q", "--", "."], cwd=env.repo_dir)
     sh(["git", "clean", "-fdq"], cwd=env.repo_dir)
 

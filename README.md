@@ -244,8 +244,21 @@ result, not a failure.
         chosen from the repo's own `requires-python`, dependencies installed as of
         the base commit's date — replacing v1's hand-tuned version pins. A table of
         magic numbers you can tune is a numerator you can tune.
-      No headline number is published yet: the harness is verified end-to-end on a
-      real Verified instance, and the frozen splits have not been swept.
+      First real sweep (dev split, 15 frozen / 9 gold-certifiable), and the
+      uncomfortable part is the point of having built it: **full RepoPilot
+      resolved 4/9 — the same four instances a plain ReAct loop resolved, at
+      twice the tokens** (545k vs 270k, 6/9 exhausting the budget against 1/9).
+      Single-shot patching scored 0/9, so nothing here is guessable from the
+      issue text alone. Whether the Reviewer helps is **not measurable at this
+      scale**: a negative control (a variant differing only by a tool that was
+      never invoked once) flipped 2 of 9 instances, so a 1-instance effect is
+      below the noise floor — temperature 0 is not determinism on an MoE model,
+      and pairing removes instance difficulty but not run-to-run variance.
+      Traces say why: 6 of 13 instances never called `edit_file` at all, burning
+      the budget still reading. The bottleneck is the absence of context
+      compaction, and every mechanism added here sits downstream of it.
+      dev is now a development sample — its failure traces were read and acted
+      on — so these are not headline numbers. See [`eval/README.md`](eval/README.md).
 - [ ] **Phase 5 (deep end, one at a time)** Docker sandbox in place of the
       blocklist (a container boundary is kernel-level; a substring blocklist is not) /
       tree-sitter or LSP in place of regex symbol extraction / context compaction /
