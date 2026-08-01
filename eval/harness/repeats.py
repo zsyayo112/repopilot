@@ -70,6 +70,10 @@ def aggregate(per_instance: dict[str, list[dict]]) -> dict[str, dict]:
             "wins": wins,
             "majority": bool(n and wins * 2 > n),
             "stable": n > 0 and (wins == n or wins == 0),
+            # 声称可信度的分子分母。跨 R 次累加 —— 单轮的 1/1 说明不了什么，
+            # 聚合后它才第一次有统计上的分量。
+            "claims": sum(1 for r in runs if r.get("ok")),
+            "claim_hits": sum(1 for r in runs if r.get("ok") and r.get("resolved")),
             "gold_ok": all(r.get("gold_ok") is not False for r in runs),
             "env_ok": all(r.get("env_ok") is not False for r in runs),
             "median_tokens": int(statistics.median(toks)) if toks else 0,
@@ -95,12 +99,17 @@ def flip_rate(agg: dict[str, dict]) -> float:
 def render(name: str, agg: dict[str, dict]) -> str:
     cert = {k: v for k, v in agg.items() if v["gold_ok"] and v["env_ok"]}
     maj = sum(v["majority"] for v in cert.values())
+    claims = sum(v.get("claims", 0) for v in cert.values())
+    claim_hits = sum(v.get("claim_hits", 0) for v in cert.values())
     lines = [
         f"### {name}",
         "",
         f"- 多数票 resolved：**{maj}/{len(cert)}**（gold 可判定实例）",
         f"- 不稳定实例（R 次里有输有赢）：{sum(not v['stable'] for v in cert.values())}"
         f"/{len(cert)} → 本配置自身噪声 {flip_rate(agg):.0%}",
+        f"- 声称可信度：**{claim_hits}/{claims}**（说\"修好了\"里真修好的；"
+        "resolved 是召回,这个是精确率,决定产出能不能免复查直接用）"
+        if claims else "- 声称可信度：—（R 次里从未声称过修好）",
         f"- 中位 token：{int(statistics.median([v['median_tokens'] for v in cert.values()])):,}"
         if cert else "",
         "",
@@ -136,18 +145,27 @@ def compare(agg_a: dict, agg_b: dict, label_a: str, label_b: str) -> str:
 
     ta = statistics.median([agg_a[k]["median_tokens"] for k in common]) if common else 0
     tb = statistics.median([agg_b[k]["median_tokens"] for k in common]) if common else 0
+
+    def _prec(agg):
+        c = sum(agg[k].get("claims", 0) for k in common)
+        h = sum(agg[k].get("claim_hits", 0) for k in common)
+        return f"{h}/{c}" if c else "—"
+
     return "\n".join([
         f"### {label_a} vs {label_b}（多数票，n={len(common)}）",
         "",
-        "| | 独赢 | 同赢 | 同败 | 多数票 resolved | 中位 token |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| | 独赢 | 同赢 | 同败 | 多数票 resolved | 声称可信度 | 中位 token |",
+        "|---|---:|---:|---:|---:|---:|---:|",
         f"| {label_a} | {len(a_only)} | {len(both)} | {len(neither)} | "
-        f"{len(a_only) + len(both)}/{len(common)} | {ta:,.0f} |",
+        f"{len(a_only) + len(both)}/{len(common)} | {_prec(agg_a)} | {ta:,.0f} |",
         f"| {label_b} | {len(b_only)} | {len(both)} | {len(neither)} | "
-        f"{len(b_only) + len(both)}/{len(common)} | {tb:,.0f} |",
+        f"{len(b_only) + len(both)}/{len(common)} | {_prec(agg_b)} | {tb:,.0f} |",
         "",
         f"噪声底噪（两者中较大的不稳定率 × n）：**{noise:.1f} 条**",
         f"结论：{verdict}",
+        "",
+        "声称可信度没有误差棒问题 —— 它不比较两配置的 resolve 差,只统计"
+        "各自说过的话有几句是真的,分母是声称次数而不是实例数。",
         "",
         (f"- `{label_a}` 独赢：{', '.join(a_only) or '无'}"),
         (f"- `{label_b}` 独赢：{', '.join(b_only) or '无'}"),

@@ -33,11 +33,19 @@ def budget_for(variant: str, base: Budget) -> Budget:
     这是"统一预算后再比较"那条要求的落点：想说明 Reviewer 有用，就不能让
     带 Reviewer 的那版顺便多拿 100k token —— 那样比出来的是钱，不是设计。
     """
+    # 每个变体的能力开关【全部显式钉死】，不继承 Budget 的默认值 ——
+    # 产品侧的默认值会跟着证据改（Reviewer 已改成默认关），而消融变体的
+    # 定义一旦被默认值牵着走，"full"就会在某次改默认后悄悄变成另一个配置，
+    # 指纹和历史全对不上。
     return {
-        "full": base,
-        "no-reviewer": base.variant(allow_reviewer=False),
-        "no-explorer": base.variant(allow_explorer=False),
-        "no-halting": base.variant(allow_halting_policy=False),
+        "full": base.variant(allow_reviewer=True, allow_explorer=True,
+                             allow_halting_policy=True),
+        "no-reviewer": base.variant(allow_reviewer=False, allow_explorer=True,
+                                    allow_halting_policy=True),
+        "no-explorer": base.variant(allow_reviewer=True, allow_explorer=False,
+                                    allow_halting_policy=True),
+        "no-halting": base.variant(allow_reviewer=True, allow_explorer=True,
+                                   allow_halting_policy=False),
         # 两个基线本来就没有这些能力，显式关掉，让 fingerprint 如实反映它们
         "baseline-a": base.variant(allow_reviewer=False, allow_explorer=False,
                                    allow_halting_policy=False, max_turns=1,

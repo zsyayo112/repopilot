@@ -180,7 +180,8 @@ def test_reviewer_rejection_triggers_another_round(git_repo, tmp_path, monkeypat
 
     result_file = tmp_path / "r.json"
     code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
-                              budget=Budget(max_fix_attempts=4, max_review_rounds=3),
+                              budget=Budget(max_fix_attempts=4, max_review_rounds=3,
+                                            allow_reviewer=True),
                               result_path=str(result_file))
 
     assert code == 1                            # 审查没通过 = 判负
@@ -229,7 +230,8 @@ def test_wall_clock_gate_stops_before_verify_and_review(git_repo, tmp_path, monk
 
     out = tmp_path / "r.json"
     code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
-                              budget=Budget(instance_timeout=1800), result_path=str(out))
+                              budget=Budget(instance_timeout=1800, allow_reviewer=True),
+                              result_path=str(out))
 
     assert code == 1
     assert verifies == [], "墙钟已经超了，不该再花十几分钟跑一次全量验证"
@@ -266,7 +268,8 @@ def test_token_limit_still_verifies_but_skips_reviewer(git_repo, tmp_path, monke
 
     out = tmp_path / "r.json"
     orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
-                       budget=Budget(instance_timeout=1800), result_path=str(out))
+                       budget=Budget(instance_timeout=1800, allow_reviewer=True),
+                       result_path=str(out))
 
     assert verifies, "TOKEN_LIMIT 不该把验证也拦掉 —— 跑一次测试一个 token 都不花"
     res = json.loads(out.read_text())

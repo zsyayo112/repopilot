@@ -102,7 +102,12 @@ class Budget:
     allow_runtime: bool = False             # 允许起服务
     allow_browser: bool = False             # 允许开浏览器
     allow_explorer: bool = True             # 允许派探索子 agent
-    allow_reviewer: bool = True             # 允许独立审查
+    # Reviewer 默认关。两次独立 sweep 的测量：它对 resolve 数贡献为零
+    # （有它没它修好的题一样多），仅有的两次关键裁决都是误杀；它真正产出
+    # 的是"声称可信度"（说修好了就没错过）—— 那只在补丁将被【自动合并、
+    # 无人复查】时值钱。所以它是按需上岗的合并闸门（CLI --review），
+    # 不是每次都跑的终审。消融变体不受此默认影响：budget_for 里逐项钉死。
+    allow_reviewer: bool = False
     allow_halting_policy: bool = True       # 允许停机/回滚策略介入
 
     def to_dict(self) -> dict:

@@ -169,7 +169,8 @@ def test_cost_exhaustion_verifies_but_skips_reviewer(git_repo, tmp_path, monkeyp
 
     out = tmp_path / "r.json"
     orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
-                       budget=Budget(model="deepseek-chat", cost_budget_usd=0.01),
+                       budget=Budget(model="deepseek-chat", cost_budget_usd=0.01,
+                                     allow_reviewer=True),
                        result_path=str(out))
 
     assert verifies, "COST_LIMIT 不该拦验证 —— 跑一次测试一分钱都不花"

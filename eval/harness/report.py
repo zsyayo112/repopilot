@@ -72,6 +72,14 @@ def summarize(rows: list[dict], manifest: dict) -> dict:
     trace_hits = [r for r in rows if any(f.get("severity") == "trace"
                                          for f in (r.get("leak_findings") or []))]
 
+    # 声称可信度：agent 自己说"修好了"（ok=True）的实例里，官方判分真通过的
+    # 比例。resolved 率是召回,这个是精确率 —— 决定人类要不要逐条复查它的产出。
+    # 实测这是 Reviewer 唯一可测的贡献：带审查 3/3 全真,不带 5/14。
+    # 只报 resolved 率会把这两种 agent 混成同一个数。
+    claims = [r for r in rows if r.get("ok")]
+    claims_true = sum(1 for r in claims if r.get("resolved"))
+    quiet_resolved = sum(1 for r in rows if r.get("resolved") and not r.get("ok"))
+
     ledgers = [r.get("ledger") or {} for r in rows]
     reviewer = _reviewer_stats(rows)
 
@@ -86,6 +94,9 @@ def summarize(rows: list[dict], manifest: dict) -> dict:
         "resolved_rate": len(resolved) / frozen if frozen else 0.0,
         "certifiable": len(certifiable),
         "resolved_on_certifiable": sum(1 for r in certifiable if r.get("resolved")),
+        "claims": len(claims),
+        "claims_true": claims_true,
+        "quiet_resolved": quiet_resolved,
         "env_failed": len(env_failed),
         "gold_artifacts": len(artifacts),
         "apply_failed": len(apply_failed),
@@ -159,6 +170,9 @@ def render(run_dir: Path, rows: list[dict], manifest: dict) -> str:
         f"{s['resolved_rate']:.0%}** |",
         f"| Resolved（仅 gold 可判定的实例） | {s['resolved_on_certifiable']}/"
         f"{s['certifiable']} |",
+        f"| **声称可信度**（说\"修好了\"里真修好的） | **{s['claims_true']}/{s['claims']}"
+        f"{'' if s['claims'] else '（没声称过）'}** |",
+        f"| 修好了但没敢声称 | {s['quiet_resolved']} |",
         f"| 环境失败 | {s['env_failed']} |",
         f"| gold 也过不了（环境伪影） | {s['gold_artifacts']} |",
         f"| 补丁无法应用 | {s['apply_failed']} |",

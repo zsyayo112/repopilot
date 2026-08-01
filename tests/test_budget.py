@@ -36,7 +36,9 @@ def test_fingerprint_changes_when_any_field_changes():
     a = Budget()
     assert a.fingerprint() == Budget().fingerprint()
     assert a.fingerprint() != a.variant(token_budget=1).fingerprint()
-    assert a.fingerprint() != a.variant(allow_reviewer=False).fingerprint()
+    # 用和默认值相反的方向翻转 —— 测试守的是'开关变了指纹必须变'，
+    # 不是某个具体默认值
+    assert a.fingerprint() != a.variant(allow_reviewer=not a.allow_reviewer).fingerprint()
 
 
 def test_ledger_stops_the_run_when_the_budget_is_gone():

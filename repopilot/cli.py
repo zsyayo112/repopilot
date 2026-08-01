@@ -48,6 +48,10 @@ def main() -> None:
                          help="结构化复现脚本（JSON）。修改前后跑同一份，隐含开启 --with-runtime")
     p_solve.add_argument("--ignore-env", action="store_true",
                          help="环境体检不通过也强行继续（不建议：会分不清代码问题和环境问题）")
+    p_solve.add_argument("--review", action="store_true",
+                         help="开启独立审查（合并闸门）。给'补丁将被自动合并、无人复查'"
+                              "的场景用：实测它不增加修复数,但它说'修好了'从没错过。"
+                              "人类反正要看补丁的话,这道闸是重复劳动,默认关")
 
     p_detect = sub.add_parser("detect", help="只探测项目类型和测试命令（不花一分钱）")
     p_detect.add_argument("--repo", required=True)
@@ -87,15 +91,21 @@ def main() -> None:
         from .github import fetch_issue
         issue = fetch_issue(args.issue_gh)
 
-    from .config import MAX_FIX_ATTEMPTS
+    from .budget import Budget
+    from .config import MAX_FIX_ATTEMPTS, MAX_MODIFIED_FILES
     from .orchestrator import solve
+    # --review 开合并闸门。其余字段与 solve() 内部的默认预算保持一致 ——
+    # 这个 flag 只该改一件事。
+    budget = (Budget(max_modified_files=MAX_MODIFIED_FILES,
+                     max_fix_attempts=MAX_FIX_ATTEMPTS, allow_reviewer=True)
+              if args.review else None)
     try:
         code = solve(
             args.repo, issue,
             test_cmd=args.test_cmd, yes=args.yes, plan_only=args.plan_only,
             max_attempts=args.max_attempts or MAX_FIX_ATTEMPTS,
             with_runtime=args.with_runtime, scenario_path=args.scenario,
-            ignore_env=args.ignore_env,
+            ignore_env=args.ignore_env, budget=budget,
         )
     except (RuntimeError, ValueError) as e:
         print(f"错误：{e}", file=sys.stderr)
