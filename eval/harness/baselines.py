@@ -35,6 +35,7 @@ import re
 from pathlib import Path
 
 from repopilot.budget import Ledger
+from repopilot.compaction import compact, should_compact
 from repopilot.config import CYAN, DIM, RESET
 from repopilot.llm import create_with_retry
 from repopilot.tools import TOOLS, ToolKit
@@ -217,6 +218,15 @@ def run_baseline_b(env, issue: str, budget, trace_dir, ws, profile) -> dict:
                                  temperature=budget.temperature,
                                  max_tokens=budget.max_output_tokens)
         ledger.record_usage(getattr(resp, "usage", None), role="baseline_b")
+        # 上下文压缩对基线【也要开】。它是基础设施，不是被消融的那个结构 ——
+        # 就像账本和预算一样。只给完整版开、不给基线开，比出来的差里就混进了
+        # 一项无关变量，而那正是"基线弱得可笑"的又一种形式（基线 A 被我自己的
+        # 输出上限截断过一次，同一个错误不犯第二遍）。
+        usage = getattr(resp, "usage", None)
+        if usage is not None and should_compact(getattr(usage, "prompt_tokens", 0) or 0):
+            evicted, saved = compact(messages)
+            if evicted:
+                print(f"  {DIM}[压缩] 折叠 {evicted} 条陈旧工具返回，省下 {saved:,} 字符{RESET}")
         msg = resp.choices[0].message
         calls = msg.tool_calls or []
         messages.append({
