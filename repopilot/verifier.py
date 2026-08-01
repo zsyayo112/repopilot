@@ -103,11 +103,21 @@ def run_tests_in(ws, profile, command: str | None, cwd: str | None = None,
 def compare(base: TestReport, after: TestReport) -> dict:
     """基线对比 —— 每个状态都是一个明确的事实判断：
 
-      fixed       基线红、现在绿：目标达成
-      still_green 基线绿、现在也绿：没破坏任何东西（改进类任务的通过态）
-      improved    失败数变少但还有红：方向对，继续修
-      regressed   出现基线里没有的新失败，**或者绿变红**：改出回归了
-      no_change   红的还是红：这轮白干
+      fixed         基线红、现在绿：目标达成
+      still_green   基线绿、现在也绿：没破坏任何东西（改进类任务的通过态）
+      improved      失败数变少但还有红：方向对，继续修
+      no_regression 基线就是红的、失败集合没变大：与 still_green 同义 ——
+                    那些红是【环境预置】的失败，不是这次改动造成的
+      regressed     出现基线里没有的新失败，**或者绿变红**：改出回归了
+      no_change     红的还是红：这轮白干
+
+    【no_regression 为什么必须存在】官方 SWE-bench 镜像的环境里,基线本来就
+    可能带着失败（实测 flask-5014 的容器里 8 个测试因 DNS 解析失败天生是红
+    的）。官方判分不受影响 —— 它只看 P2P 白名单,同一批红测试 gold 也过不了,
+    两边公平。但 agent 的循环里"红基线"让 fixed/still_green 都不可达,一份
+    正确的补丁会被 NO_PROGRESS 误杀然后回滚。语义对齐是:still_green 从来
+    只证明"没破坏任何东西",从不证明"修好了议题"（那是 Reviewer 和判分的
+    事）—— no_regression 说的是同一句话,只是基线的底色不同。
 
     结果里额外带一个 confidence：两份报告都解析成功才是 high。
     low 的意思是"我只能靠 exit_code 判断，别把 improved/no_change 当真"。
@@ -127,6 +137,9 @@ def compare(base: TestReport, after: TestReport) -> dict:
         status = "still_green"
     elif trusted and (after.failed + after.errors) < (base.failed + base.errors):
         status = "improved"
+    elif trusted and (after.failed + after.errors) <= (base.failed + base.errors):
+        # 走到这里必然 base 红、after 红、没有新增失败名单、数量没涨
+        status = "no_regression"
     else:
         status = "no_change"
 

@@ -64,8 +64,9 @@ from .workspace import Workspace
 
 # 状态严重程度：合并多个子项目的对比结果时，取最差的那个。
 # "有一个模块回归了"必须盖过"另外三个模块没事"。
-_SEVERITY = {"regressed": 4, "no_change": 3, "improved": 2, "fixed": 1, "still_green": 0}
-_OK_STATUSES = ("fixed", "still_green")
+_SEVERITY = {"regressed": 4, "no_change": 3, "improved": 2, "fixed": 1,
+             "still_green": 0, "no_regression": 0}
+_OK_STATUSES = ("fixed", "still_green", "no_regression")
 
 # 预算闸门分两档 —— 超支的【种类】要和状态的【开销】对得上，一刀切会误伤。
 #   花 token 的状态：任何一种超支都拦。token 用光了还去调模型，
@@ -360,12 +361,27 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
 
             # 测试绿了不等于没问题：跑一遍 lint/typecheck/build。
             # 只在测试已经绿的时候跑 —— 测试都红着就没必要为构建再等几分钟。
+            #
+            # 【test 步骤被显式排除】VERIFY 刚以基线相对语义跑完整套测试；
+            # validation 里的 test 步骤只看裸 exit code —— 红基线环境（官方
+            # 镜像天生带失败测试）里它永远非零，会把一份已达标、Reviewer 也
+            # 放行的补丁拖进重试循环直到 ATTEMPTS_EXHAUSTED（容器化冒烟实测,
+            # token 花了 5 倍）。绿基线下它也只是把刚跑过的套件再跑一遍。
             if tests_ok:
-                print(f"{YELLOW}[验证] 测试达标，继续跑 lint / typecheck / build…{RESET}")
-                validation = run_validation(ws, profile, only=None)
-                print(f"{DIM}{validation.render()}{RESET}")
-                trace.event("validation", ok=validation.ok,
-                            steps=[(s.name, s.exit_code, s.skipped) for s in validation.steps])
+                extra_steps = [s.name for s in profile.validation_steps()
+                               if s.name != "test"]
+                if extra_steps:
+                    print(f"{YELLOW}[验证] 测试达标，继续跑 "
+                          f"{' / '.join(extra_steps)}…{RESET}")
+                    validation = run_validation(ws, profile, only=extra_steps)
+                    print(f"{DIM}{validation.render()}{RESET}")
+                    trace.event("validation", ok=validation.ok,
+                                steps=[(s.name, s.exit_code, s.skipped)
+                                       for s in validation.steps])
+                else:
+                    validation = None
+                    trace.event("validation", ok=None,
+                                steps=[], note="除 test 外没有可执行的验证步骤")
 
             # 有复现脚本就必须跑同一份，这是"真修好"的唯一客观证据
             if tests_ok and validation is not None and validation.ok and scenario is not None:

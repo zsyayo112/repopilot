@@ -39,8 +39,21 @@ def test_improved():
     assert out["resolved_failures"] == ["b", "c"]
 
 
-def test_no_change():
+def test_red_baseline_same_failures_is_no_regression():
+    """红基线 + 失败集合原封不动 = no_regression（与 still_green 同级的通过态）。
+
+    官方镜像的环境里基线可能天生带红（实测 flask-5014 容器里 8 个测试因
+    DNS 解析失败永远是红的）。那些红不是这次改动造成的 —— 判成 no_change
+    会让一份正确的补丁被 NO_PROGRESS 误杀（v0.6 容器化冒烟实测踩到）。
+    """
     assert compare(rep(1, failed=1, names=["a"]), rep(1, failed=1, names=["a"]))["status"] \
+        == "no_regression"
+
+
+def test_red_baseline_without_parsed_names_is_still_no_change():
+    """解析不出名单（parsed=False）时不许升格成 no_regression ——
+    没有失败名单就无法证明"红的还是原来那批红的"，不确定必须显式。"""
+    assert compare(rep(1, failed=1, parsed=False), rep(1, failed=1, parsed=False))["status"] \
         == "no_change"
 
 

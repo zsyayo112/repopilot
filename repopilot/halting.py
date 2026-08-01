@@ -32,7 +32,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # 对比状态的"好坏序"。数字越小越好，用来判断"这轮比上轮好还是坏"。
-_RANK = {"fixed": 0, "still_green": 0, "improved": 1, "no_change": 2, "regressed": 3}
+# no_regression 与 still_green 同级：红基线是环境的底色，不是这轮的失分。
+_RANK = {"fixed": 0, "still_green": 0, "no_regression": 0,
+         "improved": 1, "no_change": 2, "regressed": 3}
 
 TOKEN_PRESSURE_LINE = 0.8      # 用到八成就收缩：留出的两成是给收尾和审查的
 SAME_FILE_STREAK = 3           # 同一文件连改几次没改善就判方案不成立
@@ -63,7 +65,7 @@ class Checkpoint:
         指纹当然一样 —— 那不是卡住了，那是修好了。少了这道判断，
         Reviewer 驳回后的第二轮会被"连续两次失败相同"误杀在门口。
         """
-        return self.status in ("fixed", "still_green")
+        return self.status in ("fixed", "still_green", "no_regression")
 
 
 @dataclass
