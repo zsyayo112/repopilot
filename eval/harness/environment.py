@@ -110,6 +110,7 @@ class Env:
     commit_date: str = ""          # base_commit 的日期，依赖时间线的截止点
     install_note: str = ""         # 依赖是怎么装上的（哪个 extras、有没有降级）
     test_cmd: str = ""
+    test_flags: str = ""           # 这套 pytest 实际认的参数（探出来的，不是假设的）
     test_roots: list[str] = field(default_factory=list)
     collect_exit: int | None = None   # 闸门：测试收集得起来吗
     baseline_exit: int | None = None  # 度量：全量跑完是什么结果
@@ -191,27 +192,28 @@ def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False,
             f"{env.requires_python or '（未声明）'}）+ 装 {env.commit_date[:10]} 之前的依赖…")
         if not make_venv(wd / "venv", env.python_version):
             return _fail(env, stamp, f"无法用 Python {env.python_version} 建 venv")
+        sh([str(venv_py), "-m", "pip", "install", "-q", "-U", "pip",
+            SETUPTOOLS_PIN, "wheel"], timeout=600)
         ok, note = install_deps(venv_py, repo_dir, env.commit_date)
         if not ok:
             return _fail(env, stamp, f"装依赖失败：{note[-500:]}")
         env.install_note = note
     env.venv_py = str(venv_py)
 
-    # -- 3. 测试命令：只用公开信息 --
-    env.test_roots = discover_test_roots(repo_dir)
-    env.test_cmd = derive_test_command(str(venv_py), env.test_roots)
-
-    # -- 4. 环境闸门：只证明"跑得动"，不证明"跑得快" --
+    # -- 3. 测试命令 + 环境闸门：只用公开信息，只证明"跑得动"不证明"跑得快" --
     #
     # 闸门用 --collect-only，因为它证明的正好是"环境就绪"该证明的那件事：
     # 依赖装上了、import 得进去、测试能被发现。
     # 拿跑完整套件当闸门会把【慢】和【坏】混为一谈 —— seaborn 一轮要 8 分钟，
     # 它不是坏，它只是慢，而慢是一个该被记录的数字，不是一个该被淘汰的理由。
-    log("  收集测试（环境闸门）…")
-    code, out = sh(f"{env.test_cmd} --collect-only -q", cwd=repo_dir, timeout=600)
-    if code not in (0, 5):     # 5 = 一个测试都没收集到，也算跑得动但要记下来
-        return _fail(env, stamp, f"测试收集失败 exit={code}：{out[-400:]}")
-    env.collect_exit = code
+    log("  探测 pytest 参数 + 收集测试（环境闸门）…")
+    env.test_roots = discover_test_roots(repo_dir)
+    flags, err = probe_flags(str(venv_py), repo_dir, env.test_roots)
+    if not flags:
+        return _fail(env, stamp, f"测试收集失败（各组参数都不行）：{err[-400:]}")
+    env.test_flags = flags
+    env.test_cmd = derive_test_command(str(venv_py), env.test_roots, flags)
+    env.collect_exit = 0
 
     # -- 5. 量一下全量套件要多久。这是【度量】不是【闸门】：超时不判死。 --
     # 为什么值得单独量：agent 每一轮都要跑一次测试，这个数直接决定单实例耗时，
@@ -297,6 +299,14 @@ def make_venv(path: Path, version: str) -> bool:
     return code == 0
 
 
+# setuptools 的版本卡在一个窄区间里，两头都是被实测逼出来的：
+#   >=64  才有 PEP 660 的 build_editable，低于它可编辑安装直接失败
+#   <81   才还带着 pkg_resources；81 把它删了，而 2020 年的 sphinx 在
+#         registry.py 里 `from pkg_resources import iter_entry_points`
+# 中间这段既构建得动老包，又跑得起老代码。
+SETUPTOOLS_PIN = "setuptools>=64,<81"
+
+
 def commit_date(repo_dir: Path, sha: str) -> str:
     """base_commit 的提交日期（ISO8601）。依赖时间线就截止在这一天。"""
     code, out = sh(["git", "show", "-s", "--format=%cI", sha], cwd=repo_dir, timeout=60)
@@ -337,33 +347,143 @@ def install_deps(venv_py: Path, repo_dir: Path, iso_date: str) -> tuple[bool, st
     # 而运行期依赖仍然被 --exclude-newer 钉在提交日期之前。
     base = [uv, "pip", "install", "--python", str(venv_py), "-q",
             "--no-build-isolation"]
-    if iso_date:
-        base += ["--exclude-newer", iso_date]
+    dated = base + (["--exclude-newer", iso_date] if iso_date else [])
+    notes = []
+
+    # 关掉构建隔离之后，构建依赖【必须由我们自己装好】—— 没人再替我们准备了。
+    # 它们来自 pyproject.toml 的 [build-system] requires，是公开元数据。
+    # 不装的代价是隐蔽的：pytest 用 setuptools_scm 在构建时生成 _version.py，
+    # 缺了它构建仍然"成功"，但一 import 就 `No module named '_pytest._version'`。
+    # 这些是脚手架，**不受日期约束** —— 我们要复现的是当年的依赖，不是当年的构建工具。
+    build_reqs = read_build_requires(repo_dir)
+    if build_reqs:
+        code, out = sh([*base, *build_reqs], timeout=900)
+        notes.append(f"构建依赖 {' '.join(build_reqs)}"
+                     + ("" if code == 0 else f"（装不上：{out[-120:]}）"))
 
     extras = [e for e in TEST_EXTRAS if _declares_extra(repo_dir, e)]
     targets = [f"{repo_dir}[{e}]" for e in extras] + [str(repo_dir)]
-    notes = []
     for target in targets:
-        code, out = sh([*base, "-e", target], timeout=1800)
-        if code == 0:
-            notes.append(f"已安装 {Path(target).name if '[' not in target else target}")
+        ok, note = _install_dated_or_fall_back(base, dated, ["-e", target], iso_date)
+        notes.append(note)
+        if ok:
             break
-        notes.append(f"{target} 装不上：{out.strip().splitlines()[-1][:120] if out.strip() else ''}")
     else:
         return False, "\n".join(notes)
 
+    # 仓库自己的测试依赖清单。pylint 的 tests/primer 需要 GitPython，
+    # 它既不在 extras 里也不在运行依赖里，只写在 requirements_test*.txt ——
+    # 又一份公开元数据，不读它就会把"少装一个包"记成"测试收集失败"。
+    for req in sorted(repo_dir.glob("requirements*test*.txt")) + \
+            sorted(repo_dir.glob("test-requirements*.txt")):
+        code, out = sh([*dated, "-r", str(req)], timeout=900)
+        notes.append(f"{req.name}" + ("" if code == 0 else "（部分装不上，已忽略）"))
+
     # pytest 单独装：它通常不是被测包的运行依赖，但判分协议依赖它。
-    code, out = sh([*base, "pytest"], timeout=900)
-    if code != 0:
-        notes.append(f"pytest 装不上：{out[-200:]}")
+    # **pytest 自己的实例除外** —— 在那里 pytest 就是被测对象，再装一个会把
+    # 可编辑安装覆盖掉，然后测试跑的是 PyPI 上的 pytest，不是仓库里那份。
+    if not _is_self_pytest(repo_dir):
+        code, out = sh([*dated, "pytest"], timeout=900)
+        if code != 0:
+            notes.append(f"pytest 装不上：{out[-200:]}")
+    else:
+        notes.append("跳过安装 pytest：被测对象就是 pytest 本身")
+
+    # 【最后一步：把 setuptools 也送回当年】
+    # 构建阶段需要现代 setuptools（PEP 660），但**运行阶段不需要**，而现代
+    # setuptools 会带来当年不存在的行为：80.x 一 import pkg_resources 就抛
+    #     UserWarning: pkg_resources is deprecated as an API
+    # 而 xarray / sphinx 这类仓库配了 `filterwarnings = error` —— 一个警告
+    # 变成 error，整个收集阶段崩掉。这和被测代码毫无关系。
+    # 所以顺序是：现代 setuptools 构建 → 装完之后降回提交日期那天的版本。
+    # 脚手架用完就撤走，留下的才是当年的环境。
+    if iso_date:
+        code, _ = sh([*dated, "--reinstall-package", "setuptools", "setuptools"],
+                     timeout=600)
+        notes.append("setuptools 已降回提交日期版本" if code == 0
+                     else "setuptools 未能降回当年版本（可能触发弃用警告）")
     return True, "\n".join(notes)
 
 
+def _install_dated_or_fall_back(base: list[str], dated: list[str], args: list[str],
+                                iso_date: str) -> tuple[bool, str]:
+    """先按提交日期装；日期约束让解析无解时，退回不限日期【并如实记下来】。
+
+    为什么要退路：PyPI 上的上传时间并不总和发布时间一致（撤回后重传、
+    补传旧版本都会把时间戳推后）。实测 pytest-5631 就卡在这里：
+        `atomicwrites` was filtered by `exclude-newer`
+    时间旅行是为了降低环境伪影，不是目的本身 —— 为了它把实例判死，
+    是拿手段去伤目的。
+
+    但退回【必须留痕】：install_note 会写进 env.json，再进报告。
+    一个悄悄用了今天依赖的实例，和一个用了当年依赖的实例，不是同一个测量。
+    """
+    code, out = sh([*dated, *args], timeout=1800)
+    if code == 0:
+        return True, f"已安装 {args[-1]}"
+    if not iso_date:
+        return False, f"{args[-1]} 装不上：{_last_line(out)}"
+
+    code2, out2 = sh([*base, *args], timeout=1800)
+    if code2 == 0:
+        return True, (f"已安装 {args[-1]}【但退回了不限日期的依赖】—— "
+                      f"日期约束下无解（{_last_line(out)}），本实例的依赖不是当年的版本")
+    return False, f"{args[-1]} 装不上：{_last_line(out2)}"
+
+
+def _last_line(out: str) -> str:
+    return out.strip().splitlines()[-1][:140] if out.strip() else ""
+
+
+def _is_self_pytest(repo_dir: Path) -> bool:
+    return (repo_dir / "src" / "_pytest").is_dir() or (repo_dir / "_pytest").is_dir()
+
+
+def read_build_requires(repo_dir: Path) -> list[str]:
+    """读 pyproject.toml 的 [build-system] requires。读不到就返回空。"""
+    f = repo_dir / "pyproject.toml"
+    if not f.exists():
+        return []
+    text = f.read_text(encoding="utf-8", errors="replace")
+    try:
+        import tomllib
+        reqs = tomllib.loads(text).get("build-system", {}).get("requires", [])
+    except Exception:
+        # 老仓库的 pyproject 可能不是合法 TOML（或本机 Python < 3.11），退回正则
+        m = re.search(r"\[build-system\](.*?)(?:\n\[|\Z)", text, re.S)
+        reqs = re.findall(r'["\']([^"\']+)["\']', m.group(1)) if m else []
+    # setuptools / wheel 已经按 SETUPTOOLS_PIN 装好了，别让仓库的声明把它顶掉。
+    # 【必须按完整包名比对，不能用前缀匹配】—— 实测踩过：
+    # `re.match(r"^(setuptools|wheel)\b", "setuptools-scm[toml]>=3.4")` 是**匹配的**
+    # （`-` 是非单词字符，`\b` 在那里成立），于是 setuptools-scm 被我自己的过滤器
+    # 剔掉了。而 pytest 正是靠它在构建时生成 _version.py —— 缺了这个文件，
+    # 构建照样"成功"，一 import 就 `No module named '_pytest._version'`，
+    # 三条 pytest 实例全挂在这里。
+    return [r for r in reqs if _dist_name(r) not in ("setuptools", "wheel")]
+
+
+def _dist_name(requirement: str) -> str:
+    """从 `setuptools-scm[toml]>=3.4` 里取出 `setuptools-scm`。"""
+    return re.split(r"[\[<>=!~;\s]", requirement.strip(), 1)[0].lower()
+
+
 def _declares_extra(repo_dir: Path, name: str) -> bool:
-    """仓库有没有声明这个 extras。粗判：在打包元数据里出现过这个名字。"""
+    """仓库有没有声明这个 extras。
+
+    三种写法都要认，因为它们在真实仓库里都出现：
+        setup.cfg   `testing =`           （[options.extras_require] 下）
+        pyproject   `testing = [`
+        setup.py    `"testing": [`        ← 字典字面量，用冒号不是等号
+
+    漏掉第三种的代价实测是：pytest-7236 装成了裸的 `-e .`，测试依赖
+    hypothesis 没进来，收集阶段 ModuleNotFoundError —— 看起来像环境坏了，
+    其实是我少读了一种语法。
+    """
+    n = re.escape(name)
+    pattern = rf"^\s*\[?{n}\]?\s*=|\b{n}\s*=\s*\[|[\"']{n}[\"']\s*:\s*\["
     for f in ("pyproject.toml", "setup.cfg", "setup.py"):
         p = repo_dir / f
-        if p.exists() and re.search(rf"^\s*\[?{re.escape(name)}\]?\s*=|\b{re.escape(name)}\s*=\s*\[",
+        if p.exists() and re.search(pattern,
                                     p.read_text(encoding="utf-8", errors="replace"), re.M):
             return True
     return False
@@ -378,14 +498,62 @@ def discover_test_roots(repo_dir: Path) -> list[str]:
     return []
 
 
-def derive_test_command(venv_py: str, test_roots: list[str]) -> str:
+# pytest 的参数不是万古不变的。`--color=no` 是后来才有的，2013 年的
+# pytest 2.4.2 见了它直接报 "unrecognized arguments" —— 于是整条实例挂在
+# 一个和被测代码毫无关系的地方。按【由全到简】的顺序探一遍，用第一个能跑的。
+# 探测本身也是机械的、公开的：只跑 --collect-only，不看任何答案。
+FLAG_SETS = (
+    "-q -ra --color=no -p no:randomly",   # 现代 pytest：省 token、无颜色码、禁随机顺序
+    "-q -ra --color=no",                  # 没装 pytest-randomly
+    "-q -ra",                             # 老 pytest 不认 --color
+    "-q",                                 # 更老：连 -ra 都没有
+)
+
+
+def derive_test_command(venv_py: str, test_roots: list[str],
+                        flags: str = FLAG_SETS[0]) -> str:
     """拼出测试命令。**这个函数的参数里没有 test_patch，也永远不该有。**
 
     scope 到仓库自己的测试目录是性能取舍（笔记本跑不动某些仓库的全量套件），
     不是信息取舍：agent clone 完仓库自己 ls 一下也能看到同样的目录。
     """
-    base = f"{venv_py} -m pytest -q -ra --color=no -p no:randomly"
+    base = f"{venv_py} -m pytest {flags}"
     return f"{base} {' '.join(test_roots)}" if test_roots else base
+
+
+def probe_flags(venv_py: str, repo_dir: Path, test_roots: list[str]) -> tuple[str, str]:
+    """探出这套 pytest 认哪组参数。返回 (可用参数, 最后一次错误输出)。
+
+    区分两种失败很重要：**参数不被认识**是我们自己造成的，**测试根本跑不起来**
+    才是真的环境问题。不探测的话两者都表现为"收集失败"，会把前者记成后者。
+    """
+    last = ""
+    for flags in FLAG_SETS:
+        cmd = derive_test_command(venv_py, test_roots, flags) + " --collect-only"
+        code, out = sh(cmd, cwd=repo_dir, timeout=600)
+        if code in (0, 5) or _collected_a_lot(out):
+            return flags, ""
+        last = out
+    return "", last
+
+
+# `1989 tests collected, 2 errors` —— 收集到了绝大多数，只有几个文件炸了
+_COLLECTED = re.compile(r"(\d+)\s+tests?\s+collected", re.I)
+
+
+def _collected_a_lot(output: str) -> bool:
+    """部分收集失败【不该】判死整条实例。
+
+    实测：pylint-6903 的 `tests/primer/` 需要 GitPython，收集时报 2 个 ERROR，
+    但同时 **1989 个测试收集成功**。判分只会跑 F2P/P2P 指定的那几个文件，
+    大概率就在这 1989 个里 —— 因为两个无关文件 import 失败就把整条实例扔掉，
+    等于用一个比判分更严的标准去筛实例，白白缩小可用样本。
+
+    这不会放松判分：judge 阶段仍然要求 F2P 全绿、P2P 不退步。这里放松的只是
+    "这个环境值不值得跑一次 agent"。
+    """
+    m = _COLLECTED.search(output)
+    return bool(m) and int(m.group(1)) >= 50
 
 
 def reset(env: Env) -> None:
