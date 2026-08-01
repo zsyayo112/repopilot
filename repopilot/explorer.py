@@ -53,7 +53,8 @@ EXPLORER_SYSTEM = """你是一个代码库探索助手。你的唯一任务是�
   比编一个像样的答案有用得多。"""
 
 
-def explore(toolkit, question: str, trace=None, quiet: bool = False) -> str:
+def explore(toolkit, question: str, trace=None, quiet: bool = False,
+            budget=None, ledger=None) -> str:
     """在隔离上下文里回答一个定位问题，只返回结论文本。
 
     注意它复用主 toolkit 实例（同一个仓库、同一套护栏），但【不复用 messages】——
@@ -69,7 +70,16 @@ def explore(toolkit, question: str, trace=None, quiet: bool = False) -> str:
     calls = 0
 
     for _ in range(EXPLORER_MAX_TURNS):
-        resp = create_with_retry(model=MODEL, messages=messages, tools=tools)
+        # 子 agent 花的 token 也是主任务的 token。不记在同一本账上，
+        # "explore 到底省了多少上下文、又多花了多少钱"就永远算不清。
+        if ledger is not None and ledger.exhausted():
+            return "（预算耗尽，探索子 agent 提前停止，没有结论。）"
+        resp = create_with_retry(
+            model=budget.model if budget else MODEL, messages=messages, tools=tools,
+            **({"temperature": budget.temperature} if budget else {}),
+        )
+        if ledger is not None:
+            ledger.record_usage(getattr(resp, "usage", None), role="explorer")
         msg = resp.choices[0].message
         tool_calls = msg.tool_calls or []
 
@@ -91,6 +101,8 @@ def explore(toolkit, question: str, trace=None, quiet: bool = False) -> str:
 
         for tc in tool_calls:
             calls += 1
+            if ledger is not None:
+                ledger.note_tool_call()
             name = tc.function.name
             try:
                 args = json.loads(tc.function.arguments or "{}")

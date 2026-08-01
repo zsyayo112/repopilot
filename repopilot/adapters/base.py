@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
@@ -43,6 +44,34 @@ def grab_int(pattern: str, text: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# 名词一之半：一条结构化的失败证据。
+#
+# 【为什么不能只把 pytest 输出整段丢给模型】
+# 一段 2500 字符的日志里，真正有用的是四个字段：哪个用例、什么异常、在哪一行、
+# 说了什么。剩下的是横线、collect 统计、无关 warning。整段丢进去有三个代价：
+#   1) 烧上下文（多轮之后它会被重发几十次）
+#   2) 淹没信号（模型在噪声里挑错重点，去修一个 DeprecationWarning）
+#   3) 无法比较（"这轮的失败和上轮一样吗"没法用字符串相等判断，
+#      因为耗时、临时路径每次都变 —— 见 signature()）
+# 结构化之后这三个问题一起消失。
+# ---------------------------------------------------------------------------
+@dataclass
+class TestFailure:
+    test: str                  # tests/test_config.py::test_x
+    exception: str = ""        # TypeError
+    location: str = ""         # src/config.py:48
+    message: str = ""          # 异常首行
+
+    def render(self) -> str:
+        head = self.test
+        if self.exception:
+            head += f"  [{self.exception}]"
+        if self.location:
+            head += f"  @ {self.location}"
+        return head + (f"\n      {self.message[:200]}" if self.message else "")
+
+
+# ---------------------------------------------------------------------------
 # 名词一：测试报告。所有技术栈的测试输出，最终都必须变成这一个形状。
 # ---------------------------------------------------------------------------
 @dataclass
@@ -55,6 +84,7 @@ class TestReport:
     errors: int = 0
     skipped: int = 0
     failed_names: list[str] = field(default_factory=list)
+    failures: list[TestFailure] = field(default_factory=list)  # 结构化版，有则优先用
     tail: str = ""
     parsed: bool = False       # 数字是不是真的解析出来了（False = 只有 exit_code 可信）
     framework: str = "generic"  # pytest / jest / vitest / go / cargo / junit / rspec / generic
@@ -62,6 +92,35 @@ class TestReport:
     @property
     def green(self) -> bool:
         return self.exit_code == 0
+
+    def signature(self) -> str:
+        """这次失败"长什么样"的稳定指纹 —— 停机策略判断"又是同一个错"就靠它。
+
+        故意【只取用例 id + 异常类型】，不含耗时、临时目录、内存地址：
+        那些每次都变，用整段输出做相等判断永远不相等，"连续两次一模一样"
+        这条规则就永远不会触发。
+        """
+        if self.failures:
+            items = sorted(f"{f.test}|{f.exception}" for f in self.failures)
+        elif self.failed_names:
+            items = sorted(self.failed_names)
+        else:
+            items = [f"exit={self.exit_code}", f"failed={self.failed}", f"errors={self.errors}"]
+        return hashlib.sha256("\n".join(items).encode()).hexdigest()[:16]
+
+    def evidence(self, limit: int = 6) -> str:
+        """给模型看的【结构化】失败证据。解析不出来时才退回原始日志尾巴。
+
+        这是 render() 的省 token 版本：同样的信息量，通常只要 1/5 的字符。
+        """
+        if not self.failures:
+            return self.render()
+        lines = [self.summary().splitlines()[0], "", "失败明细："]
+        for f in self.failures[:limit]:
+            lines.append("  - " + f.render())
+        if len(self.failures) > limit:
+            lines.append(f"  … 另有 {len(self.failures) - limit} 条同类失败")
+        return "\n".join(lines)
 
     def summary(self) -> str:
         s = f"exit={self.exit_code} | "

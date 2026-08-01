@@ -41,13 +41,17 @@ class ToolKit:
     def __init__(self, ws: Workspace, profile: RepoProfile | None = None, *,
                  groups: tuple[str, ...] = ("core",),
                  artifacts_dir: Path | None = None,
-                 trace=None):
+                 trace=None, budget=None, ledger=None):
         self.ws = ws
         self.root = ws.root
         self.profile = profile
         self.groups = tuple(groups)
         self.artifacts_dir = artifacts_dir
         self.trace = trace
+        # 预算/账本可以不传（单元测试、detect 子命令都不需要）。传了的话，
+        # 工具层就多一道硬约束：测试执行次数也是预算的一部分。
+        self.budget = budget
+        self.ledger = ledger
 
         # 两个重量级组件都是【懒创建】的：不调用相关工具就永远不会起进程、
         # 不会拉浏览器。定义在这里只是登记"我有这个能力"。
@@ -213,9 +217,20 @@ class ToolKit:
         """跑 adapter 给定的测试命令。模型不许自己猜测试命令 —— 猜错一次烧一轮 token。
 
         project 非空时只跑那个项目单元（monorepo 的"改哪块跑哪块"）。
+
+        返回的是【结构化失败证据】而不是整段 pytest 日志（见 base.TestReport.evidence）：
+        同样的信息量通常只要 1/5 的字符，而且模型不会再被一堆无关 warning 带偏。
+        解析不出来的技术栈会自动退回原始日志尾巴 —— 不确定要显式，不能伪装成确定。
         """
         if self.profile is None or not self.profile.test_cmd:
             return "错误：没有可用的测试命令（adapter 未识别，需要 --test-cmd）"
+
+        if self.ledger is not None:
+            self.ledger.note_test_run()
+            if self.ledger.test_runs > self.ledger.budget.max_test_runs:
+                return (f"错误：本次任务的测试执行次数已达上限 "
+                        f"{self.ledger.budget.max_test_runs}。"
+                        "先想清楚再改，不要用反复跑测试代替分析。")
 
         if project:
             repo = self.profile.repository
@@ -229,10 +244,10 @@ class ToolKit:
             # 它的解析器读不懂子项目用的 vitest/jest
             report = verifier.run_tests_in(self.ws, self.profile, unit.test_cmd,
                                            unit.path, adapter=unit.adapter)
-            return f"[project={project}]\n{report.render()}"
+            return f"[project={project}]\n{report.evidence()}"
 
         report = verifier.run_tests(self.ws, self.profile)
-        return report.render()
+        return report.evidence()
 
     def run_validation(self, only: str = "") -> str:
         """跑完整验证流水线：lint → typecheck → test → build。
@@ -254,7 +269,11 @@ class ToolKit:
         什么时候别用：你已经知道该看哪个文件了（那就直接 read_file，别绕一圈）。
         """
         from .explorer import explore as run_explore
-        return run_explore(self, question, trace=self.trace)
+        if self.budget is not None and not self.budget.allow_explorer:
+            return ("错误：本次运行关闭了探索子 agent（消融实验配置）。"
+                    "请直接用 search_code / list_symbols / read_file 自己定位。")
+        return run_explore(self, question, trace=self.trace,
+                           budget=self.budget, ledger=self.ledger)
 
     # ======================================================== 运行时
     @property

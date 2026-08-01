@@ -53,7 +53,12 @@ MAX_FIX_ATTEMPTS = 3        # 测试失败后最多整轮重试次数
 MAX_MODIFIED_FILES = 8      # 一次任务最多允许改动的文件数，防"改跑偏"
 MAX_BASELINE_UNITS = 4      # monorepo 最多给几个子项目跑基线（基线不是免费的）
 CMD_TIMEOUT = 180           # 单条命令超时（秒）
-TEST_TIMEOUT = CMD_TIMEOUT * 2  # 测试/构建放宽到 2 倍（框架项目 build 很慢）
+# 测试/构建放宽到 2 倍（框架项目 build 很慢）。
+# 可用 REPOPILOT_TEST_TIMEOUT 覆盖 —— 评测里需要它：把测试范围从"官方
+# test_patch 涉及的文件"改回"仓库自己的测试目录"之后（那条改动堵掉了一个
+# 信息泄露），跑的是全量套件，seaborn 这类项目一轮就要好几分钟。
+# 360 秒会把它们一律判超时，于是"堵住泄露"的代价变成"这些实例全废"。
+TEST_TIMEOUT = int(os.environ.get("REPOPILOT_TEST_TIMEOUT") or CMD_TIMEOUT * 2)
 
 # --- 探索子 agent（上下文隔离）---------------------------------------------
 # 它的价值不是分工，是【脏上下文留在它那边】：读十个文件九个没用，但九个都会

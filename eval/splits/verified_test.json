@@ -1,0 +1,61 @@
+{
+  "split": "test",
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "seed": "repopilot-verified-v1",
+  "size": 30,
+  "instance_ids": [
+    "psf__requests-1142",
+    "psf__requests-1766",
+    "psf__requests-1921",
+    "psf__requests-2317",
+    "psf__requests-2931",
+    "psf__requests-5414",
+    "pydata__xarray-2905",
+    "pydata__xarray-3305",
+    "pydata__xarray-3677",
+    "pydata__xarray-4695",
+    "pydata__xarray-4966",
+    "pydata__xarray-6599",
+    "pylint-dev__pylint-4604",
+    "pylint-dev__pylint-4661",
+    "pylint-dev__pylint-6528",
+    "pylint-dev__pylint-7080",
+    "pylint-dev__pylint-7277",
+    "pylint-dev__pylint-8898",
+    "pytest-dev__pytest-10051",
+    "pytest-dev__pytest-10081",
+    "pytest-dev__pytest-5840",
+    "pytest-dev__pytest-6197",
+    "pytest-dev__pytest-7205",
+    "pytest-dev__pytest-8399",
+    "sphinx-doc__sphinx-10435",
+    "sphinx-doc__sphinx-8035",
+    "sphinx-doc__sphinx-8595",
+    "sphinx-doc__sphinx-8638",
+    "sphinx-doc__sphinx-9230",
+    "sphinx-doc__sphinx-9711"
+  ],
+  "checksum": "474021fb20fda7ef",
+  "sampling_frame": {
+    "rule": "\u7eaf Python + pip \u514d\u7f16\u8bd1 + pytest + \u6709\u9876\u5c42\u6d4b\u8bd5\u76ee\u5f55\uff1b\u6309\u4ed3\u5e93\u6574\u4f53\u7eb3\u5165\u6216\u6574\u4f53\u6392\u9664\uff0c\u4e8b\u524d\u58f0\u660e\uff0c\u4e0e\u5b9e\u4f8b\u96be\u5ea6\u65e0\u5173",
+    "included_repos": [
+      "sphinx-doc/sphinx",
+      "pydata/xarray",
+      "pytest-dev/pytest",
+      "pylint-dev/pylint",
+      "psf/requests",
+      "mwaskom/seaborn",
+      "pallets/flask"
+    ],
+    "excluded_repos": {
+      "scikit-learn/scikit-learn": "\u9700\u4ece\u6e90\u7801\u7f16\u8bd1 Cython \u6269\u5c55",
+      "matplotlib/matplotlib": "\u9700\u7f16\u8bd1 C++ \u6269\u5c55",
+      "astropy/astropy": "\u9700\u7f16\u8bd1 C \u6269\u5c55",
+      "sympy/sympy": "\u6d4b\u8bd5\u6563\u5728 sympy/*/tests/\uff0c\u65e0\u9876\u5c42\u6d4b\u8bd5\u76ee\u5f55",
+      "django/django": "\u81ea\u5e26 runtests.py\uff0c\u4e0d\u8d70 pytest \u534f\u8bae"
+    },
+    "pool_size": 106,
+    "declared": "\u5728\u62bd\u6837\u4e4b\u524d\u58f0\u660e\uff0c\u6309\u4ed3\u5e93\u6574\u4f53\u7eb3\u5165/\u6392\u9664\uff0c\u4e0e\u5b9e\u4f8b\u96be\u5ea6\u65e0\u5173"
+  },
+  "rule": "\u51bb\u7ed3\u6e05\u5355\u3002\u5206\u6bcd\u53ea\u7531\u8fd9\u4efd\u6e05\u5355\u51b3\u5b9a\uff1a\u8dd1\u4e0d\u8d77\u6765\u7684\u5b9e\u4f8b\u7559\u5728\u5206\u6bcd\u91cc\uff0c\u5728\u62a5\u544a\u4e2d\u5355\u5217\u4e3a\u73af\u5883\u5931\u8d25\uff0c\u3010\u4e0d\u8bb8\u3011\u4ece\u6e05\u5355\u91cc\u5220\u9664\u3002"
+}

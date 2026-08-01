@@ -73,6 +73,25 @@ class Workspace:
         self._git("checkout", "--", ".")
         self._git("clean", "-fd")
 
+    def apply_diff(self, diff: str) -> bool:
+        """把一份 diff 重放回工作区，返回是否成功。
+
+        "回滚到最佳检查点"就是 reset_hard() + 重放那一版的 diff。
+        用 git apply 从标准输入读，不落临时文件 —— 少一个要清理的东西，
+        也不会因为写在仓库里而被自己的 `git status` 判成脏改动。
+        """
+        if not diff.strip():
+            return True
+        # 结尾那个换行不是可有可无的：git apply 会把缺少末尾换行的补丁判成
+        # "corrupt patch"。而 diff() 走的是 _git()，它对所有输出统一 strip()——
+        # 于是自己产出的 diff 喂回自己会失败。补回来。
+        proc = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn", "-"],
+            input=diff if diff.endswith("\n") else diff + "\n",
+            cwd=self.root, capture_output=True, text=True,
+        )
+        return proc.returncode == 0
+
     # -- 给 Planner 的仓库鸟瞰图 ---------------------------------------------
     def tree_summary(self, max_files: int = 300) -> str:
         """用 git ls-files 而不是 os.walk：天然跳过 .git、遵守 .gitignore。"""

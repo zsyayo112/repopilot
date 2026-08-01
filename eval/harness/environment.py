@@ -1,0 +1,413 @@
+"""环境层：把仓库准备好，并且【只用公开信息】决定测试怎么跑。
+
+【这个文件是本次改造的第一优先级】
+上一版的测试范围是这么来的：
+
+    paths = re.findall(r"^diff --git a/(\\S+)", inst["test_patch"], re.M)   # ← 泄露
+
+从 test_patch 里抠出测试文件路径，再把 agent 的测试命令 scope 到那些文件。
+省时间，但它把"官方隐藏测试藏在哪个文件"直接告诉了 agent。这条捷径一旦存在，
+所有 resolved 数字都要打折 —— 因为没人能证明 agent 不是靠它定位的。
+
+现在测试范围只来自两个公开来源：
+  1) RepoPilot 自己的 adapter 探测（它看的是 pyproject.toml 这类公开文件）
+  2) 仓库根目录下实际存在的测试目录（tests/ testing/ test/ —— ls 一下就知道）
+这两样在 agent clone 完仓库之后自己也能看到，所以它们不构成任何额外信息。
+
+【缓存策略：什么能跨版本复用，什么绝对不能】
+可以缓存（属于环境，与 agent 无关）：
+    仓库克隆、base commit、依赖安装层、adapter 探测结果、基线测试结果
+绝对不能跨 agent 版本复用（属于 agent 的产出）：
+    agent 的代码分析结论、Explorer 答案、失败后的模型上下文、上一次的补丁
+所以每次推理【开始前】都会把工作区强制复位到 pristine（reset），
+venv 和克隆则原样复用。两个 agent 版本共享的只有环境，不共享任何思考。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from .instances import PublicInstance
+
+EVAL_DIR = Path(__file__).resolve().parents[1]
+REPO_CACHE = EVAL_DIR / "cache" / "repos"      # 每个仓库一份完整克隆，所有实例共享
+ENVS_DIR = EVAL_DIR / "envs"                   # 每个实例一份 venv + 工作树
+
+# ---------------------------------------------------------------------------
+# 依赖版本：第二个"环境伪影"来源，解法和解释器版本同源
+#
+# 【问题】`pip install -e .` 装的是【今天】的依赖。2023 年的 flask 2.3 配上
+# 2025 年的 werkzeug 3.x，第一行就 AttributeError：werkzeug 删掉了 __version__。
+# 这跟 agent 会不会修 bug 毫无关系，纯粹是把代码丢进了未来。
+#
+# 【曾经的解法，以及它为什么不好】上一版维护了一张手工钉版本表：
+#     ENV_PINS = {"pallets__flask-4992": ["werkzeug<2.3"], …}
+# 它能work，但每一条都是我可以随时调到"这条终于过了"为止的魔法数字。
+# 一张能被调的表，就是一个能被调的分子。
+#
+# 【现在的解法】uv 的 --exclude-newer：只允许安装 base_commit 那天【之前】
+# 发布的版本。一条规则覆盖所有实例，依据是提交日期这个公开事实，
+# 谁跑都得到同一套依赖。没有可以调的旋钮。
+# ---------------------------------------------------------------------------
+# 装完包还要单独装 pytest（它通常不是被测包的运行依赖）。
+# 版本同样由 --exclude-newer 决定，不再手工写 `pytest<8`。
+TEST_EXTRAS = ("tests", "test", "dev", "testing")
+
+TEST_ROOT_CANDIDATES = ("tests", "testing", "test", "spec")
+
+# ---------------------------------------------------------------------------
+# 解释器版本：这一条决定了"环境伪影"有多少
+#
+# 【问题】这批实例是 2013-2023 年的，本机只有 Python 3.12。新版 Python 会对
+# 老代码抛出当年不存在的 DeprecationWarning，而很多仓库配了
+# `filterwarnings = error` —— 于是一个警告把 58 个测试全变成 ERROR。
+# 实测：pallets__flask-5014 连【官方 gold 补丁】都过不了，纯粹是 3.12 的锅。
+# 这类实例会被 gold 校准正确地标成"不可判定"，但如果一半实例都这样，
+# 这份评测就没什么可判的了。
+#
+# 【解法】按仓库【自己声明的】python_requires 选解释器。
+# 注意这是一条机械规则，不是一张手工维护的版本表：
+#   · 它读的是仓库在 base_commit 上的公开元数据（pyproject/setup.cfg/setup.py）
+#   · 与实例难不难无关，与我希望哪条通过无关
+#   · 谁都能复现同一个选择
+# 手工表（"flask 2.3 用 3.11、sphinx 用 3.9…"）也能work，但它是一串我可以
+# 随时调到好看为止的魔法数字。机械规则调不动。
+#
+# 偏好从 3.9 起：再往下装依赖的 wheel 就不全了，得现场编译，反而更脆。
+# ---------------------------------------------------------------------------
+PREFERRED_PYTHONS = ("3.9", "3.10", "3.11", "3.12")
+_REQUIRES = re.compile(r"""(?:requires-python|python_requires)\s*[=:]\s*["']([^"']+)["']""")
+
+
+def sh(cmd, cwd=None, timeout=900, text=True):
+    """跑一条命令，返回 (exit_code, 合并输出)。永不抛异常 —— 错误即信息。"""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, timeout=timeout, capture_output=True,
+                           text=text, shell=isinstance(cmd, str))
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return -1, f"超时（>{timeout}s）"
+    except OSError as e:
+        return -1, f"命令无法启动：{e}"
+
+
+@dataclass
+class Env:
+    """一个准备好的实例环境。ok=False 时 error 里写着为什么。"""
+
+    instance_id: str
+    repo_dir: Path | None = None
+    venv_py: str = ""
+    python_version: str = ""       # 实际用的解释器版本，进 manifest 和报告
+    requires_python: str = ""      # 仓库自己声明的约束，选择依据
+    commit_date: str = ""          # base_commit 的日期，依赖时间线的截止点
+    install_note: str = ""         # 依赖是怎么装上的（哪个 extras、有没有降级）
+    test_cmd: str = ""
+    test_roots: list[str] = field(default_factory=list)
+    baseline_exit: int | None = None
+    # 跑一遍全量测试要多久。这是"去掉 test_patch 泄露"的直接代价：范围从
+    # 几个文件变成整个测试目录，seaborn 这类项目一轮就要几分钟 —— 而 agent
+    # 每轮都要跑。慢到超过 agent 的测试超时，这条实例就废了，所以要量出来。
+    baseline_secs: float = 0.0
+    prepared_at: float = 0.0
+    ok: bool = False
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["repo_dir"] = str(self.repo_dir) if self.repo_dir else None
+        return d
+
+
+def env_dir(instance_id: str) -> Path:
+    return ENVS_DIR / instance_id
+
+
+def _stamp(instance_id: str) -> Path:
+    return env_dir(instance_id) / "env.json"
+
+
+def prepare(inst: PublicInstance, *, force: bool = False, quiet: bool = False) -> Env:
+    """克隆 → checkout base_commit → 建 venv 装依赖 → 探测测试命令 → 跑一次基线。
+
+    做过一次就把结果盖章存进 env.json，后续运行直接读 —— 这是最值钱的一层
+    缓存（装依赖动辄一两分钟，30 个实例就是一小时）。
+    """
+    log = (lambda *a: None) if quiet else print
+    stamp = _stamp(inst.instance_id)
+    if stamp.exists() and not force:
+        # 只取当前认识的字段：env.json 会跨代码版本存活，加/删字段不该让
+        # 几十分钟的装机成果变成一个 TypeError。
+        data = json.loads(stamp.read_text())
+        known = set(Env.__dataclass_fields__)
+        cached = Env(**{k: v for k, v in data.items() if k in known and k != "repo_dir"})
+        cached.repo_dir = env_dir(inst.instance_id) / "repo"
+        if cached.ok and cached.repo_dir.exists():
+            return cached
+
+    wd = env_dir(inst.instance_id)
+    wd.mkdir(parents=True, exist_ok=True)
+    env = Env(instance_id=inst.instance_id, prepared_at=time.time())
+
+    # -- 1. 仓库（跨实例共享的那份克隆）--
+    cache = REPO_CACHE / inst.repo.replace("/", "__")
+    if not cache.exists():
+        REPO_CACHE.mkdir(parents=True, exist_ok=True)
+        log(f"  克隆 {inst.repo} …")
+        code, out = sh(["git", "clone", f"https://github.com/{inst.repo}.git", str(cache)])
+        if code != 0:
+            return _fail(env, stamp, f"clone 失败：{out[-300:]}")
+
+    repo_dir = wd / "repo"
+    if not repo_dir.exists():
+        sh(["git", "clone", "-q", str(cache), str(repo_dir)])
+        code, out = sh(["git", "checkout", "-q", inst.base_commit], cwd=repo_dir)
+        if code != 0:
+            # 缓存的克隆可能比 base_commit 旧，拉一次再来
+            sh(["git", "fetch", "-q", "origin"], cwd=cache)
+            sh(["git", "fetch", "-q", str(cache)], cwd=repo_dir)
+            code, out = sh(["git", "checkout", "-q", inst.base_commit], cwd=repo_dir)
+            if code != 0:
+                return _fail(env, stamp, f"checkout {inst.base_commit} 失败：{out[-300:]}")
+    env.repo_dir = repo_dir
+    env.commit_date = commit_date(repo_dir, inst.base_commit)
+
+    # -- 2. venv + 依赖 --
+    env.requires_python = read_requires_python(repo_dir)
+    env.python_version = pick_python(env.requires_python)
+    venv_py = wd / "venv" / "bin" / "python"
+    if not venv_py.exists():
+        log(f"  建 venv（Python {env.python_version}，依据仓库声明的 "
+            f"{env.requires_python or '（未声明）'}）+ 装 {env.commit_date[:10]} 之前的依赖…")
+        if not make_venv(wd / "venv", env.python_version):
+            return _fail(env, stamp, f"无法用 Python {env.python_version} 建 venv")
+        ok, note = install_deps(venv_py, repo_dir, env.commit_date)
+        if not ok:
+            return _fail(env, stamp, f"装依赖失败：{note[-500:]}")
+        env.install_note = note
+    env.venv_py = str(venv_py)
+
+    # -- 3. 测试命令：只用公开信息 --
+    env.test_roots = discover_test_roots(repo_dir)
+    env.test_cmd = derive_test_command(str(venv_py), env.test_roots)
+
+    # -- 4. 基线闸门：这个环境到底跑不跑得动测试 --
+    log("  跑基线…")
+    t0 = time.time()
+    code, out = sh(env.test_cmd, cwd=repo_dir, timeout=900)
+    env.baseline_secs = round(time.time() - t0, 1)
+    env.baseline_exit = code
+    # 0=全过 1=有失败，都算"跑得动"；2/4=收集阶段就崩=环境不行
+    if code not in (0, 1):
+        return _fail(env, stamp, f"基线不可跑 exit={code}：{out[-400:]}")
+
+    env.ok = True
+    _save(env, stamp)
+    return env
+
+
+def read_requires_python(repo_dir: Path) -> str:
+    """读仓库自己声明的 python_requires / requires-python。读不到就返回空串。
+
+    只读【base_commit 上就有的】公开元数据文件 —— 和 agent 自己能看到的
+    是同一批文件，不构成任何额外信息。
+    """
+    for name in ("pyproject.toml", "setup.cfg", "setup.py"):
+        f = repo_dir / name
+        if not f.exists():
+            continue
+        m = _REQUIRES.search(f.read_text(encoding="utf-8", errors="replace"))
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def pick_python(requires: str) -> str:
+    """在偏好序列里选第一个满足约束的版本。约束读不懂就选最老的那个。
+
+    "读不懂就选最老" 是有意的保守取舍：这批代码是老的，用老解释器出问题的
+    概率远小于用新解释器 —— 新解释器带来的是【当年不存在的】警告和移除。
+    """
+    lo, hi = _parse_bounds(requires)
+    for v in PREFERRED_PYTHONS:
+        t = _tuple(v)
+        if (lo is None or t >= lo) and (hi is None or t <= hi):
+            return v
+    return PREFERRED_PYTHONS[0]
+
+
+def _tuple(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in v.split(".")[:2])
+
+
+def _parse_bounds(requires: str) -> tuple[tuple | None, tuple | None]:
+    """把 `>=3.8,<4` 这种约束解析成 (下界, 上界)。只认 >= / > / <= / < 四种。"""
+    lo = hi = None
+    for op, ver in re.findall(r"(>=|<=|>|<|==|~=)\s*([0-9.]+)", requires or ""):
+        t = _tuple(ver)
+        if op in (">=", "==", "~="):
+            lo = max(lo or t, t)
+        elif op == ">":
+            lo = max(lo or (t[0], t[1] + 1), (t[0], t[1] + 1))
+        elif op == "<=":
+            hi = min(hi or t, t)
+        elif op == "<":
+            # `<4` 对小版本没有约束（4.0 之前的 3.x 全可以），别把它算成 <3.x
+            hi = min(hi or (t[0] - 1, 99), (t[0] - 1, 99)) if len(t) == 1 or t[1] == 0 \
+                else min(hi or (t[0], t[1] - 1), (t[0], t[1] - 1))
+    return lo, hi
+
+
+def make_venv(path: Path, version: str) -> bool:
+    """建 venv。优先用 uv（它能按需下载任意版本的 CPython，几秒钟一个）。
+
+    没装 uv 就退回当前解释器 —— 那样多半会撞上新版 Python 的弃用警告，
+    但**退化要说出来**：env.json 里的 python_version 会如实记下真正用的版本，
+    报告据此解释环境伪影率为什么偏高。
+    """
+    uv = shutil.which("uv") or str(Path(sys.executable).parent / "uv")
+    if Path(uv).exists():
+        sh([uv, "python", "install", version], timeout=600)
+        code, _ = sh([uv, "venv", "--python", version, "--seed", str(path)], timeout=600)
+        if code == 0:
+            return True
+    code, _ = sh([sys.executable, "-m", "venv", str(path)], timeout=300)
+    return code == 0
+
+
+def commit_date(repo_dir: Path, sha: str) -> str:
+    """base_commit 的提交日期（ISO8601）。依赖时间线就截止在这一天。"""
+    code, out = sh(["git", "show", "-s", "--format=%cI", sha], cwd=repo_dir, timeout=60)
+    return out.strip().splitlines()[-1] if code == 0 and out.strip() else ""
+
+
+def _uv() -> str | None:
+    path = shutil.which("uv") or str(Path(sys.executable).parent / "uv")
+    return path if Path(path).exists() else None
+
+
+def install_deps(venv_py: Path, repo_dir: Path, iso_date: str) -> tuple[bool, str]:
+    """装被测包 + pytest，全部限制在 base_commit 那天之前发布的版本。
+
+    先试仓库自己声明的测试 extras（tests/test/dev），都没有就装裸的 `-e .`。
+    extras 名字来自仓库的 pyproject/setup.cfg —— 又一个公开事实，不是我编的。
+
+    没装 uv 就退回普通 pip：那样装的是今天的依赖，**大概率制造环境伪影**。
+    这条退化路径会写进 install_note，最终出现在报告里，而不是默默发生。
+    """
+    uv = _uv()
+    if uv is None:
+        code, out = sh([str(venv_py), "-m", "pip", "install", "-q", "-e", str(repo_dir),
+                        "pytest"], timeout=1800)
+        return code == 0, "退化：未安装 uv，装的是【今天】的依赖，环境伪影率会偏高\n" + out[-300:]
+
+    base = [uv, "pip", "install", "--python", str(venv_py), "-q"]
+    if iso_date:
+        base += ["--exclude-newer", iso_date]
+
+    extras = [e for e in TEST_EXTRAS if _declares_extra(repo_dir, e)]
+    targets = [f"{repo_dir}[{e}]" for e in extras] + [str(repo_dir)]
+    notes = []
+    for target in targets:
+        code, out = sh([*base, "-e", target], timeout=1800)
+        if code == 0:
+            notes.append(f"已安装 {Path(target).name if '[' not in target else target}")
+            break
+        notes.append(f"{target} 装不上：{out.strip().splitlines()[-1][:120] if out.strip() else ''}")
+    else:
+        return False, "\n".join(notes)
+
+    # pytest 单独装：它通常不是被测包的运行依赖，但判分协议依赖它。
+    code, out = sh([*base, "pytest"], timeout=900)
+    if code != 0:
+        notes.append(f"pytest 装不上：{out[-200:]}")
+    return True, "\n".join(notes)
+
+
+def _declares_extra(repo_dir: Path, name: str) -> bool:
+    """仓库有没有声明这个 extras。粗判：在打包元数据里出现过这个名字。"""
+    for f in ("pyproject.toml", "setup.cfg", "setup.py"):
+        p = repo_dir / f
+        if p.exists() and re.search(rf"^\s*\[?{re.escape(name)}\]?\s*=|\b{re.escape(name)}\s*=\s*\[",
+                                    p.read_text(encoding="utf-8", errors="replace"), re.M):
+            return True
+    return False
+
+
+def discover_test_roots(repo_dir: Path) -> list[str]:
+    """仓库自己的测试目录 —— `ls` 一下就知道的公开事实，不含任何实例信息。"""
+    roots = [d for d in TEST_ROOT_CANDIDATES if (repo_dir / d).is_dir()]
+    if roots:
+        return roots
+    # 没有顶层测试目录的项目（测试和源码放一起），退回全量
+    return []
+
+
+def derive_test_command(venv_py: str, test_roots: list[str]) -> str:
+    """拼出测试命令。**这个函数的参数里没有 test_patch，也永远不该有。**
+
+    scope 到仓库自己的测试目录是性能取舍（笔记本跑不动某些仓库的全量套件），
+    不是信息取舍：agent clone 完仓库自己 ls 一下也能看到同样的目录。
+    """
+    base = f"{venv_py} -m pytest -q -ra --color=no -p no:randomly"
+    return f"{base} {' '.join(test_roots)}" if test_roots else base
+
+
+def reset(env: Env) -> None:
+    """把工作树强制复位到 pristine。
+
+    每次推理【之前】都要跑一次。它保证的是：上一个 agent 版本留下的补丁、
+    判分阶段打上的官方 test_patch、上一轮失败的半成品，一样都不会带进下一次。
+    共享环境的前提就是这一步 —— 少了它，缓存就变成了污染。
+    """
+    if env.repo_dir is None:
+        return
+    sh(["git", "checkout", "-q", "--", "."], cwd=env.repo_dir)
+    sh(["git", "clean", "-fdq"], cwd=env.repo_dir)
+
+
+def capture_patch(env: Env) -> str:
+    """取 agent 的补丁。含未跟踪的新文件 —— 新增源文件也是修复的一部分。"""
+    if env.repo_dir is None:
+        return ""
+    # 先把未跟踪文件加进索引（不提交），这样 diff 才看得见它们
+    sh(["git", "add", "-A", "-N"], cwd=env.repo_dir)
+    _, diff = sh(["git", "diff"], cwd=env.repo_dir)
+    return diff
+
+
+def _fail(env: Env, stamp: Path, msg: str) -> Env:
+    env.ok, env.error = False, msg
+    _save(env, stamp)
+    return env
+
+
+def _save(env: Env, stamp: Path) -> None:
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(json.dumps(env.to_dict(), indent=2, ensure_ascii=False),
+                     encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 自查：证明测试命令里没有夹带答案
+# ---------------------------------------------------------------------------
+_SUSPICIOUS = re.compile(r"::|FAIL_TO_PASS|PASS_TO_PASS|test_patch", re.I)
+
+
+def assert_command_public(cmd: str) -> None:
+    """测试命令里出现 `::`（pytest 的用例级选择）就说明它是从用例清单来的。
+
+    仓库级/目录级路径是公开信息；用例级 id 不是 —— 它只可能来自 F2P/P2P。
+    这是一条很便宜、但能挡住整类回退的断言。
+    """
+    if _SUSPICIOUS.search(cmd):
+        from .instances import LeakError
+        raise LeakError(f"测试命令里出现了用例级选择或判分字段：{cmd!r}。"
+                        "测试范围只能来自公开信息（adapter 探测 + 仓库目录结构）。")

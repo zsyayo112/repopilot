@@ -7,6 +7,17 @@ runs/
 *.pyc
 dist/
 build/
-eval/work/
+
+# --- 评测产物 ---
+# 注意 eval/splits/ 【不在】忽略列表里：冻结划分必须进版本管理，
+# 不进 git 的"冻结清单"等于没冻结 —— 谁都可以悄悄改一改再跑一次。
+#
+# gitignore 里【只有整行以 # 开头才是注释】。行尾跟注释会被并进模式本身，
+# 于是 `eval/cache/  # 说明` 变成一个匹配不到任何东西的模式 —— 实测踩过：
+# 几百兆的仓库克隆被一次 `git add -A` 全都加进了索引。
+# 数据集 parquet + 仓库克隆，几个 G，可重新下载
 eval/cache/
-eval/instances.json
+# 每实例的 venv + 工作树，可重新 prepare
+eval/envs/
+# 每次评测的推理与判分产物
+eval/runs/

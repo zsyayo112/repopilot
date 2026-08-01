@@ -213,20 +213,44 @@ result, not a failure.
       structured reproduction scenarios replayed identically before and after
 - [ ] **Phase 4 (shell)** Direct GitHub issue fetching (prototype exists), automatic
       branch + draft PR creation
-- [x] **SWE-bench Lite mini-evaluation** — on 8 attempted pure-Python instances
-      in a lightweight local setting: **3/3 resolved on instances our environment
-      could certify** (gold-patch calibration: the official fix itself must pass
-      locally, else the instance is an environment artifact — Python 3.12 kills
-      several 2022-era test suites), 3/8 under the conservative reading. Scoring
-      re-implements the official protocol (revert test files → apply official
-      test patch → all FAIL_TO_PASS + PASS_TO_PASS), including its
-      whitespace-truncated test-ID matching. See [`eval/`](eval/) and
-      [`eval/RESULTS.md`](eval/RESULTS.md).
+- [x] **Evaluation harness v2 — built to survive being questioned**
+      ([`eval/`](eval/), [methodology](eval/README.md)). The v1 Lite script was
+      retired because it had a confirmed leak: it scoped the agent's test command
+      to paths extracted from the official `test_patch`, i.e. it told the agent
+      which file the hidden tests lived in. Not malice — convenience. Convenience
+      is inevitable, so the boundary is now structural rather than disciplinary:
+      - **Inference and grading are separate processes.** `PublicInstance` carries
+        exactly five fields; `test_patch` / `FAIL_TO_PASS` / `PASS_TO_PASS` / gold
+        exist only in `grader.py`. An AST check in CI fails the build if an
+        inference-side module so much as names them. The test command now comes
+        only from adapter detection plus the repo's own test directories.
+      - **SWE-bench Verified with a pre-declared sampling frame**, split into
+        frozen `dev` (15) / `test` (30) / `holdout` (10) lists committed to git
+        with checksums. The denominator is the frozen list — instances that fail
+        to build stay in it and are reported separately, never dropped.
+      - **Immutable manifest per run**: agent commit, prompt hash, tool-schema
+        hash, budget fingerprint, instance checksum, harness version.
+      - **One budget object** shared by every variant, enforced in the loop rather
+        than requested in the prompt; cost reported alongside every effect number,
+        priced with cache-hit rates counted separately.
+      - **Three baselines** (single-shot / plain ReAct / full) compared **pairwise
+        on the same instances**, because a net percentage hides the column where
+        the extra machinery made things worse.
+      - **Patch auditing** (test tampering, added skips, removed assertions,
+        dependency pinning, debug leftovers) and **single-cause failure
+        classification**, so a failure count turns into a decision about what to
+        fix next.
+      - Environment artifacts are suppressed by two mechanical rules — interpreter
+        chosen from the repo's own `requires-python`, dependencies installed as of
+        the base commit's date — replacing v1's hand-tuned version pins. A table of
+        magic numbers you can tune is a numerator you can tune.
+      No headline number is published yet: the harness is verified end-to-end on a
+      real Verified instance, and the frozen splits have not been swept.
 - [ ] **Phase 5 (deep end, one at a time)** Docker sandbox in place of the
       blocklist (a container boundary is kernel-level; a substring blocklist is not) /
       tree-sitter or LSP in place of regex symbol extraction / context compaction /
-      dependency-graph retrieval / full SWE-bench Lite sweep in the official Docker
-      harness
+      dependency-graph retrieval / the official Docker harness as the environment
+      layer, which is also what would let the sampling frame grow past seven repos
 
 ### Known gaps (stated, not hidden)
 
@@ -244,6 +268,16 @@ result, not a failure.
   count, unique-match edits). An agent that changes the wrong thing *within* the
   allowance isn't caught.
 - **No persistence.** A crashed run restarts from scratch.
+- **The evaluation's environment layer is not the official Docker harness.** Two
+  mechanical rules (era-appropriate interpreter, date-bounded dependencies) push
+  the artifact rate down a long way, but per-instance official images would push it
+  further — and are what the sampling frame would need to grow past seven repos.
+- **Reviewer false kills can only be reported as "suspected."** Establishing a real
+  one means grading the rejected revision on its own, which isn't done yet.
+- **No published headline number for the v2 harness.** It is verified end to end on
+  a real SWE-bench Verified instance; the frozen splits have not been swept. The v1
+  Lite numbers are retracted (leak — see the roadmap), and quoting them anywhere
+  would be quoting a measurement taken through a hole in the wall.
 
 ## Development
 

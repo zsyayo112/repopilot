@@ -65,6 +65,81 @@ def test_pytest_summary_taken_from_the_last_line(tmp_path):
     assert (r.passed, r.failed) == (3, 0)
 
 
+def test_pytest_quiet_mode_summary_has_no_equals_decoration(tmp_path):
+    """`pytest -q` 的收尾行没有 `====` 包围 —— 而我们自己的命令就带 -q。
+
+    只认带 `=` 的那种格式曾经是个真 bug：每一次【全绿】的运行都解析失败
+    → parsed=False → 判定可信度 low → Reviewer 被告知"没有新增失败这个结论
+    不可靠"→ 驳回一个其实完全正确的补丁。一个正则漏了一种格式，
+    代价是整条判定链的可信度塌掉。
+    """
+    out = "SKIPPED [1] tests/test_signals.py:126: blinker missing\n" \
+          "462 passed, 15 skipped in 2.06s\n"
+    r = PythonAdapter(tmp_path).parse_test_output(out, 0)
+    assert r.parsed and (r.passed, r.skipped, r.failed) == (462, 15, 0)
+
+
+def test_pytest_quiet_summary_still_ignores_decoy_lines(tmp_path):
+    """认了无装饰格式之后，仍然不能命中被测代码自己打印的 "3 passed"。
+
+    守住这条的是结尾那个 ` in 1.23s` —— 日志不会带它。
+    """
+    out = "app log: 3 passed validation checks\n5 passed in 1.0s\n"
+    r = PythonAdapter(tmp_path).parse_test_output(out, 0)
+    assert (r.passed, r.failed) == (5, 0)
+
+    only_noise = PythonAdapter(tmp_path).parse_test_output(
+        "app log: 3 passed validation checks\n", 0)
+    assert not only_noise.parsed
+
+
+def test_pytest_structured_failures_carry_location_and_exception(tmp_path):
+    """结构化失败证据：用例 id + 异常类型 + 源码位置 + 首行说明。
+
+    位置那一列是最有指导性的字段 —— 它直接告诉 agent 该去改哪个文件，
+    而整段日志只会让它在 warning 里挑错重点。
+    """
+    out = """
+=================================== FAILURES ===================================
+___________________________ test_config_from_file ______________________________
+>       assert app.config["KEY"] == "foo"
+E       TypeError: load() missing 1 required positional argument
+
+src/flask/config.py:48: TypeError
+_______________________ TestRoutes.test_subdomain[a b] _________________________
+>       assert result == expected
+E       AssertionError: assert 'x' == 'y'
+
+tests/test_cli.py:210: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_config.py::test_config_from_file - TypeError: load() missing 1 required positional argument
+ERROR tests/test_cli.py::TestRoutes::test_subdomain[a b] - AssertionError: assert 'x' == 'y'
+1 failed, 124 passed, 1 error in 3.21s
+"""
+    r = PythonAdapter(tmp_path).parse_test_output(out, 1)
+    assert [f.test for f in r.failures] == [
+        "tests/test_config.py::test_config_from_file",
+        "tests/test_cli.py::TestRoutes::test_subdomain[a b]"]
+    assert r.failures[0].exception == "TypeError"
+    assert r.failures[0].location == "src/flask/config.py:48"
+    # 参数化用例的小节标题是 `TestRoutes.test_subdomain[a b]`，摘要行是
+    # `tests/test_cli.py::TestRoutes::test_subdomain[a b]` —— 两种分隔符
+    # 都要归一，否则位置对不上号
+    assert r.failures[1].location == "tests/test_cli.py:210"
+    assert "src/flask/config.py:48" in r.evidence()
+
+
+def test_signature_is_stable_across_runs_but_not_across_failures(tmp_path):
+    """指纹只取用例 id + 异常类型，不含耗时和临时路径。"""
+    a = PythonAdapter(tmp_path).parse_test_output(
+        "FAILED t.py::x - AssertionError: q\n1 failed in 1.11s\n", 1)
+    b = PythonAdapter(tmp_path).parse_test_output(
+        "FAILED t.py::x - AssertionError: q\n1 failed in 9.99s\n", 1)
+    c = PythonAdapter(tmp_path).parse_test_output(
+        "FAILED t.py::y - AssertionError: q\n1 failed in 1.11s\n", 1)
+    assert a.signature() == b.signature() != c.signature()
+
+
 # ---------------------------------------------------------------- jest / vitest
 
 

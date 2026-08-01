@@ -15,6 +15,7 @@ from .base import (
     EnvRequirement,
     RepoAdapter,
     ServiceSpec,
+    TestFailure,
     TestReport,
     ValidationStep,
     grab_int,
@@ -32,9 +33,23 @@ PYTEST_CMD = f"{sys.executable} -m pytest -q -ra --color=no"
 
 _MARKERS = ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "tox.ini")
 
-# pytest 结尾那行长得像：==== 2 failed, 15 passed, 1 skipped in 3.21s ====
+# pytest 结尾那行有【两种】长相，取决于有没有 -q：
+#     ==== 2 failed, 15 passed, 1 skipped in 3.21s ====     默认
+#     462 passed, 15 skipped in 2.06s                       -q（我们自己用的就是它）
+#
+# 【只认第一种曾经是个真 bug】我们的测试命令是 `pytest -q -ra`，于是每一次
+# 【全绿】的运行都解析失败 → parsed=False → confidence 判 low → Reviewer 被
+# 告知"没有新增失败这个结论不可靠"→ 驳回一个其实完全正确的补丁。
+# 一个正则漏了一种格式，代价是整条判定链的可信度塌掉。
+#
+# 认第二种时必须要求结尾的 ` in 1.23s`：少了它，正则会命中被测代码自己打印的
+# 任何一句 "3 passed"（原版用 `=` 包围来防的就是这个）。
 _SUMMARY_LINE = re.compile(
     r"^=+\s*(?P<body>[^=]*?(?:passed|failed|error|skipped|no tests ran)[^=]*?)\s*=+\s*$",
+    re.M | re.I,
+)
+_BARE_SUMMARY = re.compile(
+    r"^(?P<body>(?:\d+ \w+(?:, )?)+|no tests ran)\s+in\s+[\d.]+m?s\s*$",
     re.M | re.I,
 )
 
@@ -71,8 +86,9 @@ class PythonAdapter(RepoAdapter):
         全文搜会命中测试输出里任何一处出现的 "3 passed"（比如被测代码自己
         打印的日志、或者 -v 模式下的中间统计），抠到的数字来自错误的地方。
         """
-        matches = list(_SUMMARY_LINE.finditer(output))
-        body = matches[-1].group("body") if matches else ""
+        # 两种格式都扫，取【出现位置最靠后】的那个 —— 它才是真正的收尾统计。
+        matches = [*_SUMMARY_LINE.finditer(output), *_BARE_SUMMARY.finditer(output)]
+        body = max(matches, key=lambda m: m.start()).group("body") if matches else ""
 
         parsed = bool(body)
         passed = grab_int(r"(\d+) passed", body) or 0
@@ -88,7 +104,8 @@ class PythonAdapter(RepoAdapter):
             elif re.search(r"^\s*no tests ran", output, re.M | re.I):
                 parsed = True
 
-        failed_names = _pytest_failed_names(output)
+        failures = _pytest_failures(output)
+        failed_names = [f.test for f in failures]
         # 名单比数字更可信（数字可能被"结尾那行"缺失拖累）
         if failed_names and not failed:
             failed = len(failed_names)
@@ -96,8 +113,8 @@ class PythonAdapter(RepoAdapter):
 
         return TestReport(
             exit_code=exit_code, passed=passed, failed=failed, errors=errors,
-            skipped=skipped, failed_names=failed_names, tail=tail(output),
-            parsed=parsed, framework="pytest",
+            skipped=skipped, failed_names=failed_names, failures=failures,
+            tail=tail(output), parsed=parsed, framework="pytest",
         )
 
     # -- 验证流水线 ----------------------------------------------------------
@@ -192,19 +209,89 @@ class PythonAdapter(RepoAdapter):
         ]
 
 
+# `-ra` 摘要行：FAILED tests/x.py::test_y - TypeError: 说明
+_SUMMARY_FAIL = re.compile(r"^(?:FAILED|ERROR)\s+(?P<id>\S.*?)(?:\s+-\s+(?P<msg>.*))?$")
+# 回溯里定位那一行：src/config.py:48: TypeError
+_TRACE_LOC = re.compile(r"^(?P<file>[\w./\\-]+\.py):(?P<line>\d+):\s*(?P<exc>\w+)?\s*$")
+# 失败小节标题：_______ test_name _______
+_FAIL_HEADER = re.compile(r"^_{3,}\s+(?P<name>.+?)\s+_{3,}$")
+
+
 def _pytest_failed_names(output: str) -> list[str]:
-    """从 `FAILED tests/x.py::test_y - AssertionError` 里抠出用例 id。
+    """兼容入口：只要用例 id 名单（老调用方和测试仍在用）。"""
+    return [f.test for f in _pytest_failures(output)]
+
+
+def _pytest_failures(output: str) -> list[TestFailure]:
+    """把 pytest 输出解析成结构化失败证据：用例 id + 异常类型 + 位置 + 首行说明。
 
     【这里藏着一个真实踩过的坑】按空格切分会把带空格的参数化用例 id 切碎：
         FAILED tests/t.py::test_x[a b] - assert ...
     按空格切 → `tests/t.py::test_x[a` —— 一个跑不起来的碎片。
     所以要用正则一路吃到 " - " 或行尾，而不是 split()[1]。
+
+    位置（哪个源文件第几行炸的）来自 FAILURES 小节的回溯，摘要行里没有它 ——
+    而它恰恰是最有指导性的一个字段：它直接告诉 agent 该去改哪个文件。
+    取小节里【最后一个】符合 `file.py:行号:` 的行：pytest 的回溯自外向内，
+    最后一行才是真正抛异常的地方，前面几行是调用链。
     """
-    names: list[str] = []
+    locations = _failure_locations(output)
+    failures: list[TestFailure] = []
+    seen: set[str] = set()
+
     for line in output.splitlines():
-        m = re.match(r"^(?:FAILED|ERROR)\s+(?P<id>\S.*?)(?:\s+-\s.*)?$", line.strip())
-        if m:
-            name = m.group("id").strip()
-            if name and name not in names:
-                names.append(name)
-    return names
+        m = _SUMMARY_FAIL.match(line.strip())
+        if not m:
+            continue
+        test = (m.group("id") or "").strip()
+        if not test or test in seen:
+            continue
+        seen.add(test)
+
+        msg = (m.group("msg") or "").strip()
+        # "TypeError: 说明" → 异常类型 + 说明；没有冒号就整句当说明
+        exc = ""
+        if msg:
+            head = msg.split(":", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z_][\w.]*(Error|Exception|Warning|Exit)?", head) \
+                    and head[:1].isupper():
+                exc = head
+        loc, trace_exc = locations.get(_short_name(test), ("", ""))
+        failures.append(TestFailure(test=test, exception=exc or trace_exc,
+                                    location=loc, message=msg))
+    return failures
+
+
+def _short_name(test_id: str) -> str:
+    """归一到用例短名，让两种写法能对上号。
+
+        摘要行  tests/t.py::TestX::test_y[a b]   → test_y
+        小节头  TestX.test_y[a b]                → test_y
+
+    两边格式不同（一个用 `::`，一个用 `.`），所以两种分隔符都要吃掉；
+    参数化后缀也要去掉，否则 `[a b]` 里的空格会让两边再次对不上。
+    """
+    last = test_id.split("::")[-1].split("[")[0]
+    return last.split(".")[-1].strip()
+
+
+def _failure_locations(output: str) -> dict[str, tuple[str, str]]:
+    """扫 `=== FAILURES ===` 小节，得到 用例短名 → (源码位置, 异常类型)。"""
+    found: dict[str, tuple[str, str]] = {}
+    current: str | None = None
+    for line in output.splitlines():
+        header = _FAIL_HEADER.match(line.strip())
+        if header:
+            current = _short_name(header.group("name"))
+            continue
+        if current is None:
+            continue
+        if line.startswith("=") or line.startswith("- "):   # 小节结束
+            current = None
+            continue
+        loc = _TRACE_LOC.match(line.strip())
+        if loc:
+            # 一路覆盖：回溯最后一条才是真正的抛出点
+            found[current] = (f"{loc.group('file')}:{loc.group('line')}",
+                              loc.group("exc") or "")
+    return found

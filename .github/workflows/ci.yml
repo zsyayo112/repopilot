@@ -25,6 +25,11 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      # 单独跑一遍，让"推理侧看不到答案"这条保证在 CI 界面上是可见的一格。
+      # 它是整个评测可信度的地基：这一格红了，任何 resolved 数字都无效。
+      - name: Eval isolation (inference side must not see the answers)
+        run: pytest -q tests/test_eval_isolation.py
+
       # 单元测试不接触真实模型，无需任何 API key —— 这正是 config.py 懒加载的意义。
       - name: Test (pytest)
         run: pytest -q

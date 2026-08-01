@@ -6,6 +6,96 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — evaluation methodology rebuilt (v2)
+
+The v1 SWE-bench Lite script (`eval/swebench_eval.py`) is **removed**, and its
+results (`eval/RESULTS-v1-lite-DEPRECATED.md`) are **retracted**. It scoped the
+agent's test command to file paths extracted from the official `test_patch` —
+telling the agent which file the hidden tests lived in. The numbers it produced
+cannot be used. Everything below is what replaced it.
+
+- **Inference and grading are separate processes.** `PublicInstance` carries five
+  fields and nothing else; `test_patch` / `FAIL_TO_PASS` / `PASS_TO_PASS` / gold
+  patch live only behind `grader.py`. Enforced three ways: an AST check in CI that
+  fails if an inference-side module *names* a grading symbol, a runtime assertion
+  on the exact payload handed to the agent, and a check that rejects any test
+  command containing a case-level `::` selector (directory paths are public; case
+  IDs can only have come from `FAIL_TO_PASS`). Test scope now derives solely from
+  adapter detection plus the repo's own test directories.
+- **SWE-bench Verified with a pre-declared sampling frame.** The frame is a
+  mechanical rule about what this machine can build (pure-Python, pip without
+  compilation, pytest, top-level test dir) applied whole-repo, declared before
+  sampling, and stored inside the split files alongside the instances it produced.
+  Deterministic stratified sampling into frozen `dev`/`test`/`holdout` lists,
+  committed to git with checksums that `load_split()` verifies on every read.
+- **The denominator is the frozen list.** Instances that fail to build stay in it
+  and are reported on their own line. Both readings (full and gold-certifiable)
+  are always printed, so neither can be cherry-picked.
+- **Immutable manifest** per run — agent commit (`-dirty` when the tree isn't
+  clean), prompt hash over every string that reaches the model, tool-schema hash,
+  budget fingerprint, instance checksum, harness version. Re-writing one with a
+  different configuration is an error.
+- **Gold calibration runs before inference**, not after — afterwards leaves room
+  to call whichever instance went badly an "environment artifact".
+- **Environment artifacts suppressed by two mechanical rules**: the interpreter is
+  chosen from the repo's own `requires-python`, and dependencies install as of the
+  base commit's date (`uv --exclude-newer`). This replaces v1's hand-maintained
+  version-pin table — every entry of which was a number tunable until an instance
+  passed. Measured on `pallets__flask-5014`: Python 3.12 + today's dependencies
+  make even the official gold patch fail; 3.9 + 2023-03-11 dependencies make it
+  pass. Falling back (no `uv` installed) is recorded in the report, not silent.
+- **Three baselines** — single-shot, plain ReAct, full — under one budget object,
+  compared **pairwise on the same instances**. The four-cell table exposes the
+  column a net percentage hides: instances the extra machinery lost.
+- **Cost reported next to every effect number**, priced with cache-hit tokens
+  billed separately, and `(no price table)` rather than `$0.0000` for unknown models.
+- **Failure classification** into a single primary cause from observable fields
+  only, aggregated into a tree that says what to fix next.
+
+### Added — agent changes the evaluation required
+
+- **`budget.py`** — `Budget` (frozen, hashable, derivable via `.variant()`) and
+  `Ledger` (per-role token accounting, cost, hard `exhausted()` check run at the
+  top of every executor turn). Ablation variants differ *only* in capability
+  flags; a test asserts every size and token field stays equal across them.
+- **`halting.py`** — stopping rules that read observable quantities, never the
+  model's own account of itself: identical failure fingerprint twice, three rounds
+  on one file without improvement, diff growing while failures don't shrink, 80%
+  token pressure (drops `explore` rather than stopping), Reviewer repeating a
+  request. Plus a **best-patch checkpoint**: the run submits its best round, not
+  its last. Motivated by v1 traces showing 120 tool calls and 901s spent
+  micro-adjusting one wrong approach.
+- **`patch_audit.py`** — test tampering, added skips/xfails, net-removed
+  assertions, touched eval config, changed dependency pins, hard-coded test IDs;
+  plus quality metrics (file count, line churn, stray formatting, debug leftovers,
+  public API changes). Overlap with gold is reported as a file-set Jaccard only —
+  **never text similarity**, which would reward copying the shape of the reference
+  answer rather than fixing the bug.
+- **Structured Reviewer output** (`decision` / `issue_addressed` /
+  `tests_sufficient` / `scope_minimal` / `risks` / `requested_actions`).
+  `requested_actions` turns the Reviewer from a terminal into a loop — it feeds
+  back into `EXECUTE` — and makes "is it repeating itself?" answerable.
+- **Structured test evidence** (`TestFailure`, `TestReport.evidence()`,
+  `TestReport.signature()`): test ID, exception type, source location, first line.
+  Roughly a fifth of the characters of a raw log, and the location column tells the
+  agent which file to open. The signature is what makes "the same failure twice"
+  detectable at all — raw logs contain timings and temp paths and never compare equal.
+- **`Workspace.apply_diff()`** for checkpoint restore.
+
+### Fixed
+
+- **`pytest -q` summary lines were never parsed.** The regex required the `====`
+  decoration, but `-q` — which is what RepoPilot's own test command uses — prints a
+  bare `462 passed, 15 skipped in 2.06s`. Every *green* run therefore came back
+  `parsed=False` → `confidence: low` → the Reviewer was told "no new failures" was
+  unreliable → it rejected correct patches. Observed live on `pallets__flask-5014`:
+  the same patch went from `revise` to `accept` once the line parsed. Decoy lines
+  in captured output are still ignored — the ` in 1.23s` suffix is what
+  distinguishes a summary from a log line.
+- **`HaltingPolicy` fired its no-progress rules on passing runs.** A green suite
+  twice in a row has an identical (empty) failure fingerprint, which read as "stuck"
+  and killed the round after a Reviewer rejection. Passing states are now exempt.
+
 ### Added — multi-language depth
 
 - **`adapters.py` → `adapters/` package.** Adapters now answer seven questions

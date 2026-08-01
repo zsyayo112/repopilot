@@ -45,12 +45,19 @@ def create_with_retry(**kwargs):
             time.sleep(delay)
 
 
-def json_call(system: str, user: str, retries: int = 2) -> dict:
+def json_call(system: str, user: str, retries: int = 2, *,
+              budget=None, ledger=None, role: str = "planner") -> dict:
     """一次性调用 + 强制 JSON。解析失败会把错误信息喂回模型重试。
 
     注意：DeepSeek 的 json_object 模式要求提示词里出现 "JSON" 字样，
     所以 system prompt 必须写明"只输出 JSON"。
+
+    budget / ledger 是可选的：不传就是老行为（用全局 MODEL、不记账）。
+    传了就【按预算调用、并把这次花销记到对应角色名下】——"Reviewer 多花了
+    多少 token" 这个问题只有分角色记账才答得出来。
     """
+    model = budget.model if budget is not None else MODEL
+    extra = {"temperature": budget.temperature} if budget is not None else {}
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -59,14 +66,16 @@ def json_call(system: str, user: str, retries: int = 2) -> dict:
     for _ in range(retries + 1):
         try:
             resp = create_with_retry(
-                model=MODEL, messages=messages,
-                response_format={"type": "json_object"},
+                model=model, messages=messages,
+                response_format={"type": "json_object"}, **extra,
             )
         except BadRequestError:
             # 只有 400（网关不支持 response_format）才走这条降级路；
             # 503/429 已在 create_with_retry 里退避处理，不再被一把抓吞掉
-            resp = create_with_retry(model=MODEL, messages=messages)
+            resp = create_with_retry(model=model, messages=messages, **extra)
 
+        if ledger is not None:
+            ledger.record_usage(getattr(resp, "usage", None), role=role)
         text = resp.choices[0].message.content or ""
         try:
             return _parse(text)

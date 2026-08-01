@@ -25,7 +25,7 @@ PLANNER_SYSTEM = """你是资深软件工程师，负责为一个代码仓库的
 要求：假设可以不确定，但必须具体、可验证。不要泛泛而谈。"""
 
 
-def make_plan(issue: str, ws, profile, baseline) -> dict:
+def make_plan(issue: str, ws, profile, baseline, *, budget=None, ledger=None) -> dict:
     user = f"""## Issue
 {issue}
 
@@ -38,7 +38,7 @@ def make_plan(issue: str, ws, profile, baseline) -> dict:
 ## 仓库文件清单
 {ws.tree_summary()}
 """
-    return json_call(PLANNER_SYSTEM, user)
+    return json_call(PLANNER_SYSTEM, user, budget=budget, ledger=ledger, role="planner")
 
 
 def render_plan(plan: dict) -> str:

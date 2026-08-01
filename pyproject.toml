@@ -49,6 +49,9 @@ include = ["repopilot*"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# 评测产物里是【别人的仓库】—— 克隆下来的被测代码、每实例的 venv、运行轨迹。
+# 拿我们的 lint 规则去检查 sphinx 的源码毫无意义，只会把真正的问题淹掉。
+exclude = ["eval/cache", "eval/envs", "eval/runs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]

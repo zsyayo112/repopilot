@@ -56,17 +56,24 @@ def system_prompt(groups: tuple[str, ...]) -> str:
     return EXECUTOR_SYSTEM
 
 
-def _stream_once(messages: list, tools: list) -> tuple[str, list, int]:
+def _stream_once(messages: list, tools: list, budget=None,
+                 ledger=None) -> tuple[str, list, int]:
     """一次流式请求：边收边打印文本，拼装 tool_calls 碎片。原样继承 agent/loop.py。
 
     tools 现在由调用方传入（来自 toolkit.specs()）而不是写死的全局 TOOLS ——
     因为工具按能力分组暴露，不同任务拿到的工具列表不一样。
+
+    budget / ledger 可选：不传就是老行为（全局 MODEL、不记账、不限输出长度）。
     """
     # create_with_retry：503 过载/限流/超时自动退避重试（见 llm.py 顶部说明）。
     # 只保护"发起请求"这一步；流已经开始后中断的情况极少，MVP 不做续流。
+    extra = {}
+    if budget is not None:
+        extra = {"temperature": budget.temperature,
+                 "max_tokens": budget.max_output_tokens}
     stream = create_with_retry(
-        model=MODEL, messages=messages, tools=tools,
-        stream=True, stream_options={"include_usage": True},
+        model=budget.model if budget else MODEL, messages=messages, tools=tools,
+        stream=True, stream_options={"include_usage": True}, **extra,
     )
 
     content_parts: list[str] = []
@@ -77,6 +84,8 @@ def _stream_once(messages: list, tools: list) -> tuple[str, list, int]:
     for chunk in stream:
         if chunk.usage:
             prompt_tokens = chunk.usage.prompt_tokens
+            if ledger is not None:
+                ledger.record_usage(chunk.usage, role="executor")
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -131,13 +140,29 @@ def build_initial_messages(issue: str, plan_text: str, baseline_summary: str,
 
 
 def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
-                 trace: Trace) -> tuple[str, int]:
-    """跑一轮 executor（就地修改 messages），返回 (最终总结文本, 峰值上下文 tokens)。"""
+                 trace: Trace, budget=None, ledger=None,
+                 narrowed: bool = False) -> tuple[str, int]:
+    """跑一轮 executor（就地修改 messages），返回 (最终总结文本, 峰值上下文 tokens)。
+
+    narrowed=True 时收掉 explore 工具：token 压力到八成之后再派探索子 agent，
+    是拿收尾的额度去赌一次定位。剩下的额度应该留给"把已经知道的东西改完"。
+    """
     peak_tokens = 0
     tools = toolkit.specs()
+    if narrowed:
+        tools = [t for t in tools if t["function"]["name"] != "explore"]
+    max_turns = budget.max_turns if budget else MAX_TURNS
 
-    for _ in range(MAX_TURNS):
-        content, tool_calls, prompt_tokens = _stream_once(messages, tools)
+    for _ in range(max_turns):
+        # 硬约束：每一圈开头先查账。这是"预算是对象不是提示词"的兑现之处 ——
+        # 超支不靠模型自觉，靠这里 return。
+        if ledger is not None and (over := ledger.exhausted()):
+            print(f"\n{RED}[预算耗尽：{over}，executor 停止]{RESET}")
+            trace.event("executor_budget_exhausted", code=over,
+                        peak_tokens=peak_tokens, **ledger.to_dict())
+            return f"（预算耗尽 {over}，本轮提前停止）", peak_tokens
+
+        content, tool_calls, prompt_tokens = _stream_once(messages, tools, budget, ledger)
         peak_tokens = max(peak_tokens, prompt_tokens)
         messages.append(_msg_to_dict(content, tool_calls))
 
@@ -146,6 +171,8 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
             return content, peak_tokens
 
         for tc in tool_calls:
+            if ledger is not None:
+                ledger.note_tool_call()
             name, raw_args = tc["name"], tc["arguments"]
             try:
                 args = json.loads(raw_args) if raw_args.strip() else {}
@@ -173,6 +200,6 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
             print(f"  {DIM}↳ {preview}{'…' if len(result) > 90 else ''}{RESET}")
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
 
-    print(f"\n{RED}[executor 达到最大轮数 {MAX_TURNS}，强制停止]{RESET}")
+    print(f"\n{RED}[executor 达到最大轮数 {max_turns}，强制停止]{RESET}")
     trace.event("executor_max_turns", peak_tokens=peak_tokens)
     return "（达到最大轮数被强制停止，工作可能未完成）", peak_tokens
