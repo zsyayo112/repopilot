@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 from repopilot.budget import Ledger
 from repopilot.config import CYAN, DIM, RESET
@@ -41,14 +42,31 @@ from repopilot.tools import TOOLS, ToolKit
 # ---------------------------------------------------------------------------
 # 基线 A：单轮生成补丁
 # ---------------------------------------------------------------------------
+# 【为什么不让它输出 unified diff】
+# 第一版让它直接吐 `git apply` 能用的 diff，实测结果是一份退化的输出：
+# 几十个几乎相同的 `@@` hunk，从头到尾每隔十行加一个空行，行号全是编的。
+# 原因是结构性的 —— 基线 A 只拿得到【文件清单】，从来没看过文件内容，
+# 它**不可能**写出正确的上下文行和行号。于是这个基线测出来的一大半是
+# "会不会写 diff 语法"，而不是"会不会修 bug"。
+#
+# 换成 search/replace 编辑格式之后，混淆项消失了：
+#   它知道那段代码长什么样  → search 块能命中 → 考的是定位和修法
+#   它不知道               → 命中不了       → 诚实地失败在该失败的地方
+# 这个格式也和 RepoPilot 自己的 edit_file 工具同语义（唯一命中才替换），
+# 前后一致。约束没有变松：仍然是一次调用、没有工具、没有验证、没有重试。
 BASELINE_A_SYSTEM = """你是一个修复代码仓库 issue 的工程师。你【只有一次机会】：
-读完下面的 issue 和仓库文件清单，直接输出一个可以用 `git apply` 打上的统一 diff。
+读完下面的 issue 和仓库文件清单，直接给出要做的代码修改。
+
+只输出一个 JSON 对象：
+{"edits": [{"path": "相对路径", "search": "要被替换的原始代码片段", "replace": "替换后的代码"}]}
 
 要求：
-- 只输出 diff，不要任何解释文字、不要 markdown 围栏。
-- 路径必须来自给出的文件清单，格式为 `diff --git a/路径 b/路径`。
-- 必须包含正确的 `@@` 行号信息和上下文行。
-- 改动要最小：只改与 issue 直接相关的地方。"""
+- path 必须来自给出的文件清单。
+- search 必须是文件里【逐字符精确存在且唯一】的一段代码（含缩进），
+  凭你对这个项目的了解写出来。宁可多带几行上下文保证唯一，也不要写错。
+- replace 是这段代码替换后的样子。
+- 改动要最小：只改与 issue 直接相关的地方。
+- 不要输出解释文字，不要 markdown 围栏。"""
 
 
 def run_baseline_a(env, issue: str, budget, trace_dir) -> dict:
@@ -63,27 +81,39 @@ def run_baseline_a(env, issue: str, budget, trace_dir) -> dict:
     files = "\n".join(tree.splitlines()[:400])
 
     user = (f"## Issue\n{issue}\n\n## 仓库文件清单\n{files}\n\n"
-            "现在直接输出修复用的 unified diff。")
+            "现在直接输出修改。")
     resp = create_with_retry(
         model=budget.model,
         messages=[{"role": "system", "content": BASELINE_A_SYSTEM},
                   {"role": "user", "content": user}],
         temperature=budget.temperature, max_tokens=budget.max_output_tokens,
+        response_format={"type": "json_object"},
     )
     ledger.record_usage(getattr(resp, "usage", None), role="baseline_a")
-    raw = resp.choices[0].message.content or ""
-    diff = _extract_diff(raw)
+    choice = resp.choices[0]
+    raw = choice.message.content or ""
     (trace_dir / "baseline_a_raw.txt").write_text(raw, encoding="utf-8")
 
-    if diff.strip():
-        applied, note = _apply(env.repo_dir, diff)
+    # 【必须单独认出"被截断"这一种失败】否则它长得和"改错了"一模一样。
+    # 但前者是【我们的预算】掐断了它唯一一次输出，后者才是它自己的能力问题。
+    # 实测踩过：4096 的上限把输出从中间切断，基线 A 因此挂零 ——
+    # 那是我们让它输的，不是它输的。把两者混在一起，等于把评测者自己造成的
+    # 失败记到被测方案头上。
+    truncated = getattr(choice, "finish_reason", "") == "length"
+
+    if truncated:
+        applied, note = False, (
+            f"模型输出被 max_output_tokens={budget.max_output_tokens} 截断"
+            "（预算造成的失败，不是能力问题）")
     else:
-        applied, note = False, "模型没有输出任何 diff"
+        applied, note = _apply_edits(env.repo_dir, raw)
 
     return {
         "ok": applied,
-        "halt_code": "" if applied else "PATCH_APPLY_FAILED",
+        "halt_code": ("" if applied else
+                      "OUTPUT_TRUNCATED" if truncated else "PATCH_APPLY_FAILED"),
         "abort_reason": None if applied else note,
+        "output_truncated": truncated,
         "attempts": 1, "review_rounds": 0,
         "test_status": None, "validation_ok": None,
         "reviewer": {"enabled": False, "decision": None, "rejections": 0, "rounds": []},
@@ -92,20 +122,54 @@ def run_baseline_a(env, issue: str, budget, trace_dir) -> dict:
     }
 
 
-def _extract_diff(text: str) -> str:
-    """模型总会不听话地包一层 ```diff 围栏，剥掉。"""
-    m = re.search(r"```(?:diff|patch)?\s*\n(.+?)```", text, re.S)
-    body = m.group(1) if m else text
-    start = body.find("diff --git")
-    return body[start:] if start >= 0 else body
+def _apply_edits(repo_dir, raw: str) -> tuple[bool, str]:
+    """把 search/replace 编辑落到磁盘上。语义和 RepoPilot 的 edit_file 一致：
+    **必须唯一命中才替换** —— 命中多处说明片段不够具体，盲目替换会误伤。
+
+    失败原因要分得细，因为它们说的是不同的事：
+      JSON 都不合法        → 连格式都没遵守
+      search 一次都没命中  → 它不知道这段代码长什么样（定位/知识问题）
+      search 命中多处      → 它给的片段不够唯一（表达问题）
+    这三种混成一句"补丁打不上"，就没法回答"单轮到底卡在哪一步"。
+    """
+    try:
+        payload = json.loads(_strip_fence(raw))
+        edits = payload.get("edits") or []
+    except (json.JSONDecodeError, AttributeError) as e:
+        return False, f"输出不是合法 JSON：{e}"
+    if not edits:
+        return False, "模型没有给出任何修改"
+
+    applied, problems = 0, []
+    for i, ed in enumerate(edits):
+        path, search, replace = (ed.get("path"), ed.get("search"), ed.get("replace"))
+        if not path or search is None or replace is None:
+            problems.append(f"第 {i + 1} 条编辑字段不全")
+            continue
+        target = Path(repo_dir) / path
+        if not target.is_file():
+            problems.append(f"{path} 不存在")
+            continue
+        text = target.read_text(encoding="utf-8", errors="replace")
+        hits = text.count(search)
+        if hits == 0:
+            problems.append(f"{path}: search 片段没有命中（它写的代码和真实代码对不上）")
+        elif hits > 1:
+            problems.append(f"{path}: search 片段命中 {hits} 处，不唯一")
+        else:
+            target.write_text(text.replace(search, replace, 1), encoding="utf-8")
+            applied += 1
+
+    if applied:
+        return True, (f"应用了 {applied}/{len(edits)} 条编辑"
+                      + (f"；未应用：{'；'.join(problems[:2])}" if problems else ""))
+    return False, "；".join(problems[:3]) or "没有任何编辑被应用"
 
 
-def _apply(repo_dir, diff: str) -> tuple[bool, str]:
-    import subprocess
-    proc = subprocess.run(["git", "apply", "--whitespace=nowarn", "-"],
-                          input=diff if diff.endswith("\n") else diff + "\n",
-                          cwd=repo_dir, capture_output=True, text=True)
-    return proc.returncode == 0, (proc.stdout + proc.stderr)[-300:]
+def _strip_fence(text: str) -> str:
+    """模型总会不听话地包一层 ```json 围栏，剥掉。"""
+    m = re.search(r"```(?:json)?\s*\n(.+?)```", text, re.S)
+    return (m.group(1) if m else text).strip()
 
 
 def _git(repo_dir, *args):

@@ -323,7 +323,20 @@ def install_deps(venv_py: Path, repo_dir: Path, iso_date: str) -> tuple[bool, st
                         "pytest"], timeout=1800)
         return code == 0, "退化：未安装 uv，装的是【今天】的依赖，环境伪影率会偏高\n" + out[-300:]
 
-    base = [uv, "pip", "install", "--python", str(venv_py), "-q"]
+    # --no-build-isolation：**构建工具链不参与时间旅行，只有依赖参与。**
+    #
+    # 不加这个参数时，uv 会为构建单独开一个隔离环境，而那个环境里的 setuptools
+    # 也受 --exclude-newer 约束 —— 于是 2020 年的实例拿到 2020 年的 setuptools，
+    # 它早于 PEP 660，没有 build_editable，可编辑安装直接失败：
+    #     AttributeError: module 'setuptools.build_meta' has no attribute 'build_editable'
+    # 实测代价：dev 划分 15 条里 11 条卡在这里。
+    #
+    # 语义上这也是对的：我们要复现的是【这个库当年的依赖环境】，不是
+    # 【当年的打包工具】。setuptools 是脚手架，不是被测对象。
+    # 关掉隔离后构建用 venv 里的现代 setuptools（建 venv 时就装好了），
+    # 而运行期依赖仍然被 --exclude-newer 钉在提交日期之前。
+    base = [uv, "pip", "install", "--python", str(venv_py), "-q",
+            "--no-build-isolation"]
     if iso_date:
         base += ["--exclude-newer", iso_date]
 

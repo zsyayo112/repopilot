@@ -33,6 +33,10 @@ TAXONOMY = [
     ("TIMEOUT", "单实例墙钟超时"),
     ("TOKEN_LIMIT", "token 预算耗尽"),
     ("TOOL_CALL_LIMIT", "工具调用次数耗尽"),
+    # 这一类【必须】和补丁写错分开：两者都表现为 git apply 失败，但截断是
+    # 【我们的预算】掐断了它，不是它自己的能力问题。混在一起会让评测者
+    # 把自己造成的失败记到被测方案头上。
+    ("OUTPUT_TRUNCATED", "模型输出被 max_output_tokens 截断，补丁不完整（预算问题，非能力问题）"),
     ("PATCH_APPLY_FAILED", "补丁格式不对，git apply 失败"),
     ("NO_PATCH", "跑完了但一行代码都没改"),
     ("ISSUE_NOT_REPRODUCED", "改之前就无法复现 issue，主动停止"),
@@ -88,6 +92,8 @@ def classify(row: dict) -> str:
                                               "TOOL_CALL_LIMIT", "ISSUE_NOT_REPRODUCED"):
         return _HALT_TO_CATEGORY[halt]
 
+    if row.get("output_truncated") or halt == "OUTPUT_TRUNCATED":
+        return "OUTPUT_TRUNCATED"
     if row.get("patch_applied") is False:
         return "PATCH_APPLY_FAILED"
     if row.get("empty_patch"):
