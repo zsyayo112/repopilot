@@ -213,7 +213,7 @@ class ToolKit:
         output = (proc.stdout + proc.stderr).strip()
         return f"exit_code={proc.returncode}\n{output or '(无输出)'}"
 
-    def run_tests(self, project: str = "") -> str:
+    def run_tests(self, project: str = "", scope: str = "") -> str:
         """跑 adapter 给定的测试命令。模型不许自己猜测试命令 —— 猜错一次烧一轮 token。
 
         project 非空时只跑那个项目单元（monorepo 的"改哪块跑哪块"）。
@@ -242,9 +242,24 @@ class ToolKit:
                 return f"错误：项目单元 {project} 没有可用的测试命令"
             # 用【这个单元自己的】adapter 解析：根目录可能是 workspace 管理者，
             # 它的解析器读不懂子项目用的 vitest/jest
-            report = verifier.run_tests_in(self.ws, self.profile, unit.test_cmd,
+            cmd = unit.test_cmd
+            if scope:
+                cmd = verifier.scoped_command(cmd, self.root / unit.path, scope)
+            report = verifier.run_tests_in(self.ws, self.profile, cmd,
                                            unit.path, adapter=unit.adapter)
             return f"[project={project}]\n{report.evidence()}"
+
+        if scope:
+            try:
+                target = jail(scope, self.root)
+            except PermissionError as e:
+                return f"错误：{e}"
+            if not target.exists():
+                return f"错误：{scope} 不存在。scope 必须是仓库里真实存在的测试文件或目录。"
+            rel = target.relative_to(self.root).as_posix()
+            cmd = verifier.scoped_command(self.profile.test_cmd, self.root, rel)
+            report = verifier.run_tests_in(self.ws, self.profile, cmd)
+            return f"[scope={rel}]\n{report.evidence()}"
 
         report = verifier.run_tests(self.ws, self.profile)
         return report.evidence()
@@ -527,9 +542,15 @@ CORE_TOOLS = [
         {"command": {"type": "string"}}, ["command"]),
     _fn("run_tests",
         "运行项目测试套件（命令由系统配置，你不用关心）。每次实质修改后都应调用。"
-        "monorepo 里可以用 project 只跑一个单元的测试，快很多。",
+        "**改完一处代码要快速验证时，一定要用 scope 把范围缩到相关的测试文件** —— "
+        "跑全量套件可能要好几分钟，而且会把大量无关输出灌进你的上下文。"
+        "收尾前再不带 scope 跑一次全量，确认没有改坏别处。"
+        "monorepo 里可以用 project 只跑一个单元的测试。",
         {"project": {"type": "string",
-                     "description": "可选：项目单元路径（来自 list_projects），留空=主项目"}},
+                     "description": "可选：项目单元路径（来自 list_projects），留空=主项目"},
+         "scope": {"type": "string",
+                   "description": "可选：只跑这个测试文件或目录，例如 "
+                                  "'tests/test_config.py' 或 'tests/api'。留空=全量"}},
         []),
     _fn("run_validation",
         "跑完整验证流水线：lint → typecheck → test → build。"

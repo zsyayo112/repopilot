@@ -26,11 +26,46 @@ DANGEROUS = [
 ]
 
 
+# 【软约束变硬约束：跑测试必须走 run_tests】
+#
+# 提示词里一直写着"跑测试只用 run_tests 工具"。实测结果：一轮评测里
+# run_bash 被调用 147 次、run_tests 只有 13 次 —— 提示词被无视了。
+# 而绕过去的代价不是风格问题，是【三个机制一起失效】：
+#     结构化失败证据（省 token、直接给出源码位置）→ 变回裸日志
+#     测试执行次数预算                              → 计数器读数是 0
+#     失败指纹（停机策略靠它判"又是同一个错"）      → verifier 看不到这些运行
+# agent 这么做是理性的：以前 run_tests 只能跑全量、要好几分钟。
+# 所以这一条必须【和 run_tests 的 scope 参数一起】上线 —— 先给它一条更好的
+# 路，再堵掉旧路。只堵不给，等于把它逼进死胡同。
+_TEST_RUNNER = re.compile(
+    r"(^|[\s;&|(])(py\.?test|tox|nox|nosetests|unittest\b|jest|vitest|mocha|"
+    r"karma|rspec|minitest|phpunit)\b"
+    r"|(^|[\s;&|(])(go|cargo|npm|pnpm|yarn|bun|mvn|gradle|dotnet|swift)\s+test\b"
+    r"|-m\s+(pytest|unittest|nose)\b", re.I)
+
+# `cd` 同理：提示词写了"严禁 cd"，实测照样出现在几乎每条 run_bash 里。
+# 危害是真实的 —— 所有工具的路径都以仓库根为基准，agent 一旦在脑子里
+# 换了工作目录，它给 read_file / edit_file 的路径就会开始漂。
+_CD = re.compile(r"(^|[\s;&|])cd\s", re.I)
+
+
 def check_command(command: str) -> tuple[bool, str]:
     """返回 (是否放行, 拒绝理由)。"""
     for pat in DANGEROUS:
         if pat in command:
             return False, f"命令被安全策略拒绝（匹配到 {pat!r}）"
+    if _TEST_RUNNER.search(command):
+        return False, (
+            "跑测试请用 run_tests 工具，不要用 run_bash 自己拼命令。\n"
+            "要快速验证一处改动就带上 scope，例如 "
+            'run_tests(scope="tests/test_config.py")。\n'
+            "理由：run_tests 会把测试输出解析成结构化证据（用例 id + 异常类型 + "
+            "源码位置），比裸日志省得多，也更容易看出该改哪里。")
+    if _CD.search(command):
+        return False, (
+            "不要 cd。命令已经在仓库根目录执行，所有工具的路径也都以仓库根为基准；"
+            "换了工作目录之后你给出的相对路径会开始对不上。"
+            "需要在子目录里跑就用 `make -C <dir>` 这类不改变工作目录的写法。")
     return True, ""
 
 

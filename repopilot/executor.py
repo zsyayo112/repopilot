@@ -11,6 +11,7 @@
 
 import json
 
+from .compaction import compact, should_compact
 from .config import BOLD, CYAN, DIM, MAX_TURNS, MODEL, RED, RESET, YELLOW
 from .llm import create_with_retry
 from .permissions import Permissions
@@ -25,7 +26,10 @@ EXECUTOR_SYSTEM = """你是一个在真实 git 仓库里解决 issue 的编程 a
 - 要翻很多文件才能定位时，用 explore 派子 agent 去查（它读的文件不占你的上下文）。
 - 修改一律用 edit_file（精确片段替换）；只有创建全新文件才用 write_file。
 - 每次实质修改后立刻 run_tests 验证；失败就读输出、分析、修正、再跑。
-- 跑测试只用 run_tests 工具，不要用 run_bash 自己拼测试命令。
+- 跑测试只用 run_tests 工具（run_bash 里的测试命令会被策略拒绝）。
+  迭代时【一定要带 scope】把范围缩到相关的测试文件，例如
+  run_tests(scope="tests/test_config.py") —— 全量套件可能要好几分钟，
+  而且会把大量无关输出灌进你的上下文。收尾前再不带 scope 跑一次确认没改坏别处。
 - 测试莫名失败（比如报模块找不到）时，先 check_environment —— 环境问题你改代码修不好。
 - 严禁改动与 issue 无关的文件；严禁 cd；所有路径相对仓库根目录。
 - 收尾前跑一次 run_validation：测试绿不代表 lint/类型检查/构建也绿。
@@ -165,6 +169,17 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
         content, tool_calls, prompt_tokens = _stream_once(messages, tools, budget, ledger)
         peak_tokens = max(peak_tokens, prompt_tokens)
         messages.append(_msg_to_dict(content, tool_calls))
+
+        # 上下文压缩。放在【拿到本轮 prompt_tokens 之后】而不是发请求之前，
+        # 因为触发判断需要一个真实测得的数字 —— 自己估 token 会估错，
+        # 而估错的方向通常是低估（工具返回值里全是代码，token 密度高）。
+        if should_compact(prompt_tokens):
+            evicted, saved = compact(messages)
+            if evicted:
+                print(f"{DIM}[压缩] 上下文 {prompt_tokens} tokens 触发压缩："
+                      f"折叠了 {evicted} 条陈旧工具返回，省下 {saved:,} 字符{RESET}")
+                trace.event("compaction", prompt_tokens=prompt_tokens,
+                            evicted=evicted, saved_chars=saved)
 
         if not tool_calls:
             trace.event("executor_done", peak_tokens=peak_tokens)

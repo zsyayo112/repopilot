@@ -43,6 +43,37 @@ def run_tests(ws, profile) -> TestReport:
     return run_tests_in(ws, profile, profile.test_cmd, cwd=None)
 
 
+def scoped_command(command: str, root, scope: str) -> str:
+    """把测试命令的范围换成 scope（一个文件或目录）。
+
+    【为什么需要它】评测里的测试命令长这样：
+
+        …/python -m pytest -q -ra --color=no tests
+
+    末尾那个 `tests` 是整个测试目录，跑一遍要 65~480 秒。agent 改完一处只想
+    验证一个文件，于是它绕过 run_tests、自己用 run_bash 拼命令 —— 实测
+    147 次 vs 13 次。绕过去的代价是：结构化失败证据、测试次数预算、
+    失败指纹（停机策略靠它判"又是同一个错"）**三样一起失效**。
+
+    做法是把命令末尾那些【确实存在的路径】摘掉，换成 scope。为什么按
+    "存在性"判断而不是按位置：命令里还有 `-q`、`--color=no` 这类参数，
+    它们不是路径；而路径参数一定能在仓库里找到对应的文件或目录。
+
+    【这不是重新引入泄露】泄露的定义是【我们】告诉 agent 隐藏测试在哪。
+    agent 根据自己的探索决定跑哪个文件，是它自己的推理 —— 和它 ls 一下
+    目录性质相同。评测线束仍然只给出目录级的默认范围，见
+    eval/harness/environment.py。
+    """
+    tokens = command.split()
+    while len(tokens) > 1 and not tokens[-1].startswith("-"):
+        candidate = (root / tokens[-1])
+        if candidate.exists():
+            tokens.pop()
+        else:
+            break
+    return " ".join([*tokens, scope])
+
+
 def run_tests_in(ws, profile, command: str | None, cwd: str | None = None,
                  adapter=None) -> TestReport:
     """在仓库的某个子目录里跑指定测试命令 —— monorepo 的"改哪块跑哪块"靠它。
