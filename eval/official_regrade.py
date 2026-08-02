@@ -67,6 +67,9 @@ def build_predictions(run_id: str) -> Path:
 def run_official(predictions: str, run_id: str, ids: list[str], workers: int) -> None:
     """调官方 harness。namespace=swebench 表示拉 Docker Hub 上的预构建镜像,
     不在本机现场构建（构建要的内存这台机器付不起）。"""
+    # cwd 指向的目录必须先存在：--gold 可能是干净机器上跑的第一条命令
+    # （云端实测踩雷：本地它总被更早的 build_predictions 顺手建出来）。
+    OFFICIAL_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [PY, "-m", "swebench.harness.run_evaluation",
            "--dataset_name", DATASET,
            "--predictions_path", str(predictions),
