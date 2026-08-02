@@ -423,18 +423,46 @@ def _container_fixups(env: Env) -> tuple[bool, str]:
     1) 被测包统一转 editable —— requests 的镜像是非 editable 安装，agent 改
        源码不生效；其余仓库本就是 -e .，重装无害。官方 judge 判分前会按 spec
        重装一遍，判分语义不受影响。
-    2) chown -R 把 /testbed 归还宿主 uid —— 容器写的每个文件宿主都可删，
+    2) 补装仓库自己声明的测试依赖（extras + requirements*test*.txt）。
+       官方镜像只装到"判分够用"为止 —— judge 只跑 F2P/P2P 文件；而 agent 要
+       收集整个测试目录，缺一个 hypothesis 老 pytest 就在收集阶段 Interrupted，
+       一个测试都不给（实测 3 条 pytest 实例全挂在这）。依赖清单是仓库的公开
+       元数据，与 venv 路径同一套机械规则；版本没有 --exclude-newer 可用，
+       由容器内 pip 按解释器约束就近解析 —— 这点漂移只影响 agent 的本地套件，
+       不影响判分（judge 环境从不装它们），如实记入 install_note。
+    3) chown -R 把 /testbed 归还宿主 uid —— 容器写的每个文件宿主都可删，
        reset() / git clean 才可信。
     """
     import os as _os
-    pip = (f"{env.container_python} -m pip install -e . "
-           f"--no-deps --no-build-isolation -q")
-    code, out = sh(["docker", "exec", "-u", "0", "-w", "/testbed",
-                    env.container_name, "bash", "-c", pip], timeout=900)
-    note = "" if code == 0 else f"editable 修补失败（agent 的源码改动可能不生效）：{out[-200:]}"
+
+    def _exec_pip(args: str, timeout: int = 900):
+        return sh(["docker", "exec", "-u", "0", "-w", "/testbed",
+                   env.container_name, "bash", "-c",
+                   f"{env.container_python} -m pip install -q "
+                   f"--no-build-isolation {args}"], timeout=timeout)
+
+    notes = []
+    code, out = _exec_pip("--no-deps -e .")
+    if code != 0:
+        notes.append(f"editable 修补失败（agent 的源码改动可能不生效）：{out[-200:]}")
+
+    repo_dir = Path(env.repo_dir) if env.repo_dir else None
+    if repo_dir is not None:
+        for extra in TEST_EXTRAS:
+            if _declares_extra(repo_dir, extra):
+                code, out = _exec_pip(f'-e ".[{extra}]"', timeout=1200)
+                notes.append(f"测试 extras [{extra}]"
+                             + ("" if code == 0 else f"（装不上：{out[-120:]}）"))
+                if code == 0:
+                    break
+        for req in sorted(repo_dir.glob("requirements*test*.txt")) + \
+                sorted(repo_dir.glob("test-requirements*.txt")):
+            code, out = _exec_pip(f'-r "/testbed/{req.name}"', timeout=1200)
+            notes.append(f"{req.name}" + ("" if code == 0 else "（部分装不上，已忽略）"))
+
     sh(["docker", "exec", "-u", "0", env.container_name, "chown", "-R",
         f"{_os.getuid()}:{_os.getgid()}", "/testbed"], timeout=600)
-    return True, note
+    return True, "；".join(notes)
 
 
 def _write_git_excludes(repo_dir: Path) -> None:
