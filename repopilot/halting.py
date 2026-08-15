@@ -53,6 +53,9 @@ class Checkpoint:
     failures: int
     signature: str
     summary: str = ""
+    # 这一轮的新增失败名单。回滚到这个检查点时，对外报告的 new_failures
+    # 必须跟着换成这一份 —— 否则工作区是补丁 B、报告里却挂着补丁 C 的回归名单。
+    new_failures: list[str] = field(default_factory=list)
 
     @property
     def score(self) -> tuple[int, int]:
@@ -116,6 +119,7 @@ class HaltingPolicy:
             failures=_failure_count(report, comparison),
             signature=report.signature() if report is not None else "",
             summary=comparison.get("after", ""),
+            new_failures=list(comparison.get("new_failures") or []),
         )
         improved = self._improved_over_previous(cp)
         for path in modified:

@@ -251,6 +251,11 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
             _restore_best(ws, halting, trace)
             if comparison is None:
                 comparison = _unverified_comparison(over)
+            else:
+                # 工作区可能刚被换成历史最佳补丁，结论必须跟着换 ——
+                # 否则报告说的是最后一轮的成绩，交出去的却是另一份补丁。
+                comparison, after_report = _rebuild_comparison(
+                    halting, comparison, after_report)
             state = "REVIEW"
             continue
 
@@ -348,6 +353,12 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
             if decision.action == "stop":
                 halt_code = decision.code
                 _restore_best(ws, halting, trace)
+                # rollback 分支下面就有这一步，stop 分支曾经漏掉：交出的是
+                # 历史最佳补丁，报告却写着最后一轮的 regressed 和它的回归名单。
+                # 真实案例（tenacity#233）：交付补丁明明达标，result.json 却说
+                # "ok": false —— 成功的 run 被自己的报告说成失败。
+                comparison, after_report = _rebuild_comparison(
+                    halting, comparison, after_report)
                 if decision.code == "MODIFIED_FILES_EXCEEDED":
                     # 改动规模超限判为跑偏：不送 REVIEW（对一堆乱改跑审查既费钱
                     # 又无意义），但【仍要经过 REPORT】——把 diff 和回滚命令交给用户。
@@ -359,7 +370,8 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
 
             if decision.action == "rollback":
                 _restore_best(ws, halting, trace)
-                comparison, after_report = _rebuild_comparison(halting, comparison)
+                comparison, after_report = _rebuild_comparison(
+                    halting, comparison, after_report)
 
             tests_ok = comparison["status"] in _OK_STATUSES
 
@@ -707,17 +719,20 @@ def _unverified_comparison(code: str) -> dict:
             "new_failures": []}
 
 
-def _rebuild_comparison(halting: HaltingPolicy, current: dict) -> tuple[dict, None]:
+def _rebuild_comparison(halting: HaltingPolicy, current: dict,
+                        after_report=None) -> tuple[dict, object]:
     """回滚之后，对外的结论也要跟着换成最佳检查点那一版的。
 
     不换会出现一个很难查的错：工作区里是补丁 B，报告里写的却是补丁 C 的成绩。
+    最佳就是最新时原样返回：没有发生回滚，结论和失败指纹都还是现场的。
     """
     best = halting.best
-    if best is None:
-        return current, None
+    if best is None or (halting.history and best is halting.history[-1]):
+        return current, after_report
     restored = dict(current)
     restored["status"] = best.status
     restored["after"] = best.summary or current.get("after", "")
+    restored["new_failures"] = list(best.new_failures)
     restored["rolled_back_to_attempt"] = best.attempt
     return restored, None
 

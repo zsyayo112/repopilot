@@ -196,6 +196,48 @@ def test_improved_over_red_baseline_is_done_not_another_round(
     assert res["test_status"] == "improved"
 
 
+def test_stop_reports_the_delivered_patch_not_the_last_round(
+        git_repo, tmp_path, monkeypatch):
+    """TOKEN_LIMIT 止损交出第 1 轮补丁时，result.json 说的必须是第 1 轮的成绩。
+
+    曾经的行为：工作区里是回滚后的最佳补丁，报告里却是最后一轮的 regressed
+    和它的回归名单 —— 成功交付被自己的报告说成失败（rollback 分支有
+    _rebuild_comparison，stop 分支漏了）。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    seq = [TestReport(exit_code=1, failed=2, parsed=True, failed_names=["a", "b"]),
+           TestReport(exit_code=1, failed=4, parsed=True,
+                      failed_names=["a", "b", "c", "d"])]
+    calls = {"n": 0}
+    monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: seq[0])
+    monkeypatch.setattr(orchestrator, "run_tests_in",
+                        lambda *a, **k: seq[min(calls["n"], len(seq)) - 1])
+    monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
+        "status": "no_change" if a.failed == 2 else "regressed",
+        "new_failures": [] if a.failed == 2 else ["t::c", "t::d"],
+        "confidence": "high", "baseline": "2 failed", "after": f"{a.failed} failed"})
+
+    def fake_exec(toolkit, perms, messages, trace, *, ledger=None, **kw):
+        calls["n"] += 1
+        (git_repo / "a.py").write_text(f"x = {calls['n']}\n")
+        if calls["n"] == 2:
+            ledger.prompt_tokens = ledger.budget.token_budget + 1
+        return ("done", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
+
+    out = tmp_path / "r.json"
+    orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                       budget=Budget(max_fix_attempts=3, allow_reviewer=False),
+                       result_path=str(out))
+
+    res = json.loads(out.read_text())
+    assert res["halt_code"] == "TOKEN_LIMIT"
+    assert (git_repo / "a.py").read_text() == "x = 1\n", "交出的应是第 1 轮最佳补丁"
+    assert res["test_status"] == "no_change", "结论必须是交付补丁的，不是最后一轮的"
+    assert res["new_failures"] == [], "回滚后不该再挂着最后一轮的回归名单"
+    assert res["halting"]["best_attempt"] == 1
+
+
 def test_reviewer_rejection_triggers_another_round(git_repo, tmp_path, monkeypatch):
     """Reviewer 驳回 → 回到 EXECUTE；同一个要求提第二次 → 停止重修。"""
     _stub_common(monkeypatch, tmp_path)
