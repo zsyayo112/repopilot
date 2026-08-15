@@ -8,7 +8,7 @@
 """
 
 from repopilot.compaction import (
-    KEEP_RECENT,
+    KEEP_RECENT_CHARS,
     compact,
     context_chars,
     should_compact,
@@ -57,13 +57,48 @@ def test_system_prompt_and_the_task_itself_are_never_touched():
 
 
 def test_recent_tool_results_survive_verbatim():
-    """最近几次工具返回是【当前正在处理的证据】，压掉它等于让 agent 失忆。"""
+    """最近几次工具返回是【当前正在处理的证据】，压掉它等于让 agent 失忆。
+
+    保护窗口按【字符预算】：size=2000 时预算罩住最近 KEEP_RECENT_CHARS/2000 条。
+    """
     msgs = _history(20)
     compact(msgs)
     tools = [m for m in msgs if m["role"] == "tool"]
-    for m in tools[-KEEP_RECENT:]:
-        assert not m["content"].startswith("[已省略"), "最近的工具返回不该被压缩"
-    assert any(m["content"].startswith("[已省略") for m in tools[:-KEEP_RECENT])
+    guard = KEEP_RECENT_CHARS // 2000
+    for m in tools[-guard:]:
+        assert not m["content"].startswith("[已省略"), "预算内的工具返回不该被压缩"
+    assert any(m["content"].startswith("[已省略") for m in tools[:-guard])
+
+
+def test_protection_window_narrows_when_results_are_big():
+    """字符预算的意义所在：返回值越大，按条数算的保护窗口越窄。
+
+    按【条数】保留 6 条整段 diff 会守住 5 万多字符 —— 窗口大小完全失控，
+    这正是 testify#1785 里关键证据反被挤出去的机制。
+    """
+    msgs = _history(20, size=9000)
+    compact(msgs)
+    tools = [m for m in msgs if m["role"] == "tool"]
+    intact = [m for m in tools if not m["content"].startswith("[已省略")]
+    assert len(intact) == 2      # ceil(16000/9000)：预算只罩得住最近两条
+
+
+def test_folded_placeholder_keeps_the_key_lines():
+    """折叠不是销毁：diff hunk 头、测试失败行这些"要点"要留在占位符里。
+
+    testify#1785 的教训：模型刚拿到 v1.10..v1.11 的 diff 就被折叠，
+    只记得自己的【错误结论】，证据没了，只好全价重读。
+    """
+    msgs = _history(20)
+    msgs[7]["content"] = ("diff --git a/mock.go b/mock.go\n"
+                          + "x" * 500
+                          + "\n@@ -938,6 +948,8 @@ func Diff\n"
+                          + "y" * 500
+                          + "\n--- FAIL: TestArgumentMatcher\n" + "z" * 500)
+    compact(msgs)
+    assert msgs[7]["content"].startswith("[已省略")
+    assert "@@ -938,6 +948,8 @@" in msgs[7]["content"]
+    assert "--- FAIL: TestArgumentMatcher" in msgs[7]["content"]
 
 
 def test_assistant_reasoning_survives():
@@ -106,7 +141,7 @@ def test_compaction_actually_shrinks_and_is_idempotent():
 
 
 def test_nothing_happens_when_history_is_still_short():
-    msgs = _history(KEEP_RECENT)
+    msgs = _history(6)      # 6 × 2000 = 12000 字符，在保护预算内
     assert compact(msgs) == (0, 0)
 
 

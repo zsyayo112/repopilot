@@ -32,7 +32,8 @@ dev 划分首轮评测的结论很刺眼：**13 条实例里 6 条，agent 从�
 【什么不压缩】
   · system 提示词
   · 第一条 user 消息（issue + 计划 + 基线）—— 任务本身，丢了就跑偏
-  · 最近 KEEP_RECENT 次工具返回 —— 当前正在处理的证据
+  · 最近 KEEP_RECENT_CHARS 字符内的工具返回 —— 当前正在处理的证据
+    （按字符预算而不是条数：保护窗口的实际大小必须可控）
   · 短的返回值 —— 压缩它们省不下什么，还平白丢信息
 
 【和 Explorer 的关系】
@@ -55,37 +56,76 @@ from __future__ import annotations
 # 按这个目标，门槛必须远低于窗口 —— 它该在"历史开始变重"的时候就介入，
 # 而不是在"快装不下了"的时候。
 COMPACT_AT_TOKENS = 12_000
-# 最近这么多次工具返回一字不动 —— 它们是当前正在处理的证据。
-KEEP_RECENT = 6
+# 保护窗口按【字符预算】而不是条数：6 条 list_files 和 6 条整段 diff 差一个
+# 数量级，按条数保留时窗口的实际大小完全不可控。testify#1785 实测的翻车
+# 现场：模型刚拿到 v1.10..v1.11 的关键 diff，6 次小工具调用之后它就被折叠，
+# 只好全价重读 —— 同一行段被读了 3-4 次。改按字符预算后，"最近的证据"
+# 的定义是稳定的：不管大小搭配如何，保护的都是这么多上下文。
+KEEP_RECENT_CHARS = 16_000
 # 短于此的返回值不压缩：省不下什么，还平白丢信息。
 MIN_EVICT_CHARS = 400
 
-_PLACEHOLDER = "[已省略 {name} 的 {n} 字符输出以节省上下文。需要的话重新调用工具获取。]"
+_PLACEHOLDER = "[已省略 {name} 的 {n} 字符输出以节省上下文。{keys}需要的话重新调用工具获取。]"
+
+# 折叠前抢救出来的"要点行"：确定性的纯文本抽取（沿用"不引入模型调用"的
+# 设计哲学）。只认无歧义的结构标记 —— diff 的 hunk 头、测试失败行、崩溃头。
+# 证据被折叠后模型只记得自己的结论；结论错了的话，这几行是它翻案的线索。
+_KEY_MARKERS = ("@@", "--- FAIL", "FAILED", "Traceback", "panic:", "=== RUN")
+_MAX_KEY_LINES = 4
 
 
 def should_compact(prompt_tokens: int, threshold: int = COMPACT_AT_TOKENS) -> bool:
     return prompt_tokens >= threshold
 
 
-def compact(messages: list, keep_recent: int = KEEP_RECENT,
+def _key_lines(content: str) -> list[str]:
+    keys = []
+    for line in content.splitlines():
+        s = line.strip()
+        if s.startswith(_KEY_MARKERS):
+            keys.append(s[:120])
+            if len(keys) >= _MAX_KEY_LINES:
+                break
+    return keys
+
+
+def compact(messages: list, keep_recent_chars: int = KEEP_RECENT_CHARS,
             min_chars: int = MIN_EVICT_CHARS) -> tuple[int, int]:
     """就地压缩消息数组，返回 (被压缩的条数, 省下的字符数)。
 
     只动 role=="tool" 的 content，其余一律不碰 —— 见文件头第 2 条。
+    从最新的工具返回往回数，累计字符量在预算内的是"当前正在处理的证据"，
+    一字不动；越过预算线的才算陈旧。最新一条永远受保护，哪怕它一条就超预算。
     """
     tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-    if len(tool_idx) <= keep_recent:
+
+    protected: set[int] = set()
+    budget = keep_recent_chars
+    for i in reversed(tool_idx):
+        protected.add(i)
+        budget -= len(messages[i].get("content") or "")
+        if budget <= 0:
+            break
+    if len(protected) == len(tool_idx):
         return 0, 0
 
     names = _tool_names(messages)
     evicted = saved = 0
-    for i in tool_idx[:-keep_recent] if keep_recent else tool_idx:
+    for i in tool_idx:
+        if i in protected:
+            continue
         content = messages[i].get("content") or ""
         if len(content) < min_chars or content.startswith("[已省略"):
             continue
-        messages[i]["content"] = _PLACEHOLDER.format(
-            name=names.get(messages[i].get("tool_call_id"), "工具"), n=len(content))
-        saved += len(content) - len(messages[i]["content"])
+        keys = _key_lines(content)
+        keys_text = ("要点：\n  " + "\n  ".join(keys) + "\n") if keys else ""
+        placeholder = _PLACEHOLDER.format(
+            name=names.get(messages[i].get("tool_call_id"), "工具"),
+            n=len(content), keys=keys_text)
+        if len(placeholder) >= len(content):
+            continue      # 带要点的占位符比原文还长 —— 折了是负收益
+        messages[i]["content"] = placeholder
+        saved += len(content) - len(placeholder)
         evicted += 1
     return evicted, saved
 
