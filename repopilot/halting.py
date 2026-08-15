@@ -33,8 +33,11 @@ from dataclasses import dataclass, field
 
 # 对比状态的"好坏序"。数字越小越好，用来判断"这轮比上轮好还是坏"。
 # no_regression 与 still_green 同级：红基线是环境的底色，不是这轮的失分。
-_RANK = {"fixed": 0, "still_green": 0, "no_regression": 0,
-         "improved": 1, "no_change": 2, "regressed": 3}
+# improved 也在 0 级：它只可能在红基线下出现，且剩余失败必然是基线红的子集
+# —— 严格优于 no_regression。同级之间靠 score 的失败数分高下，improved
+# 的失败数一定更少。把它排在 1 会让 no_regression 在选最佳补丁时反超它。
+_RANK = {"fixed": 0, "still_green": 0, "no_regression": 0, "improved": 0,
+         "no_change": 2, "regressed": 3}
 
 TOKEN_PRESSURE_LINE = 0.8      # 用到八成就收缩：留出的两成是给收尾和审查的
 SAME_FILE_STREAK = 3           # 同一文件连改几次没改善就判方案不成立
@@ -64,8 +67,14 @@ class Checkpoint:
         在已经通过的状态下是【好事】：测试连续两轮都绿、失败集合都是空集，
         指纹当然一样 —— 那不是卡住了，那是修好了。少了这道判断，
         Reviewer 驳回后的第二轮会被"连续两次失败相同"误杀在门口。
+
+        improved 也算通过：它只可能在红基线下出现（绿基线下任何失败都是
+        regressed），剩余的红全是基线预置的环境底色。真实案例（tenacity#233）：
+        基线 7 红 → 修完 6 红判 improved，循环却因"没全绿"又烧了一整轮预算
+        去修那 6 个与 issue 无关的环境失败，直到 TOKEN_LIMIT 才靠止损交卷。
+        与基线打平的 no_regression 都算过，严格更好的 improved 没有理由不算。
         """
-        return self.status in ("fixed", "still_green", "no_regression")
+        return self.status in ("fixed", "still_green", "no_regression", "improved")
 
 
 @dataclass
@@ -120,10 +129,11 @@ class HaltingPolicy:
         if cp.is_passing:
             return True
         # 第一轮没有"上一轮"可比，但它有【基线】可比 —— 而 status 本来就是
-        # 相对基线的判断。把第一轮无条件算作有进展，会让 streak 白白少一格，
+        # 相对基线的判断。走到这里的第一轮只剩 no_change / regressed，
+        # 都不算进展。把第一轮无条件算作有进展，会让 streak 白白少一格，
         # 于是"连续三轮没改善"实际要跑四轮才触发。
         if not self.history:
-            return cp.status == "improved"
+            return False
         return cp.score < self.history[-1].score
 
     # -- 裁决 ---------------------------------------------------------------

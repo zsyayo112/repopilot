@@ -113,6 +113,35 @@ def test_token_pressure_narrows_before_it_stops():
     assert p.decide(led, ["s.py"]).action == "continue"
 
 
+def test_improved_rounds_are_passing_not_stuck():
+    """improved 连续两轮指纹相同不是卡住 —— 剩下的红全是基线预置的环境底色。
+
+    真实案例（tenacity#233）：基线 7 红、修完剩 6 红判 improved。improved
+    不算通过态的话，这里会被 SAME_FAILURE_TWICE 拦下 —— 和 still_green
+    连续两轮被误杀是同一个错。
+    """
+    p = _policy()
+    led = Ledger(budget=p.budget)
+    for i in (1, 2):
+        p.record(i, _cmp("improved"),
+                 _report(6, [f"t::e{j}" for j in range(6)]), f"d{i}", ["s.py"])
+        assert p.decide(led, ["s.py"]).action == "continue"
+
+
+def test_best_checkpoint_prefers_improved_over_no_regression():
+    """improved（红少于基线）严格优于 no_regression（与基线打平）。
+
+    improved 排 1 级的话，一个失败都没修掉的 no_regression 反而会在
+    选最佳补丁时胜出 —— 交卷交的就是那份没修好的。
+    """
+    p = _policy()
+    p.record(1, _cmp("no_regression"),
+             _report(7, [f"t::e{j}" for j in range(7)]), "A", ["s.py"])
+    p.record(2, _cmp("improved"),
+             _report(6, [f"t::e{j}" for j in range(6)]), "B", ["s.py"])
+    assert p.best.diff == "B"
+
+
 def test_exceeding_the_file_limit_stops_the_run():
     p = _policy(max_modified_files=2)
     led = Ledger(budget=p.budget)

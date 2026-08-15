@@ -135,8 +135,10 @@ def test_keeps_best_patch_not_latest(git_repo, tmp_path, monkeypatch):
     monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: seq[0])
     monkeypatch.setattr(orchestrator, "run_tests_in",
                         lambda *a, **k: seq[min(calls["n"], len(seq)) - 1])
+    # 三轮全是 no_change：improved 现在是通过态，会让循环正确地停在 B ——
+    # 但这个测试守的是"C 改坏后回滚到 B"的路径，得让三轮都不达标才走得到 C。
     monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
-        "status": "improved" if a.failed < 3 else "no_change", "new_failures": [],
+        "status": "no_change", "new_failures": [],
         "confidence": "high", "baseline": "3 failed", "after": f"{a.failed} failed"})
 
     def fake_exec(toolkit, perms, messages, trace, **kw):
@@ -150,6 +152,48 @@ def test_keeps_best_patch_not_latest(git_repo, tmp_path, monkeypatch):
 
     # 第 2 轮（失败 1 个）是最佳；第 3 轮把它改坏了，必须被回滚掉
     assert (git_repo / "a.py").read_text() == "x = 2\n"
+
+
+def test_improved_over_red_baseline_is_done_not_another_round(
+        git_repo, tmp_path, monkeypatch):
+    """红基线 7 个失败、修完剩 6 个（全是基线预置的）→ 已达标，必须停。
+
+    真实案例（tenacity#233）：这条路径曾因"没全绿"又烧了一整轮预算去修
+    与 issue 无关的环境失败，直到 TOKEN_LIMIT 才靠止损交出第 1 轮的正确补丁。
+    与基线打平的 no_regression 都算过，严格更好的 improved 没有理由不算。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    base = TestReport(exit_code=1, failed=7, parsed=True,
+                      failed_names=[f"t::e{i}" for i in range(7)])
+    after = TestReport(exit_code=1, failed=6, parsed=True,
+                       failed_names=[f"t::e{i}" for i in range(6)])
+    monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: base)
+    monkeypatch.setattr(orchestrator, "run_tests_in", lambda *a, **k: after)
+    monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
+        "status": "improved", "new_failures": [], "confidence": "high",
+        "baseline": "7 failed", "after": "6 failed"})
+    monkeypatch.setattr(orchestrator, "run_validation",
+                        lambda *a, **k: type("V", (), {"ok": True, "steps": [],
+                                                       "render": lambda self: ""})())
+
+    rounds = []
+
+    def fake_exec(toolkit, perms, messages, trace, **kw):
+        rounds.append(1)
+        (git_repo / "a.py").write_text("x = 1\n")
+        return ("done", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
+
+    out = tmp_path / "r.json"
+    code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                              budget=Budget(max_fix_attempts=3, allow_reviewer=False),
+                              result_path=str(out))
+
+    assert code == 0
+    assert len(rounds) == 1, "improved 已达标，不该再烧一轮去修基线预置的失败"
+    res = json.loads(out.read_text())
+    assert res["ok"] is True
+    assert res["test_status"] == "improved"
 
 
 def test_reviewer_rejection_triggers_another_round(git_repo, tmp_path, monkeypatch):

@@ -66,7 +66,11 @@ from .workspace import Workspace
 # "有一个模块回归了"必须盖过"另外三个模块没事"。
 _SEVERITY = {"regressed": 4, "no_change": 3, "improved": 2, "fixed": 1,
              "still_green": 0, "no_regression": 0}
-_OK_STATUSES = ("fixed", "still_green", "no_regression")
+# improved 也是通过态：它只可能在红基线下出现，剩余的红全是基线预置的环境
+# 底色（verifier.compare 的第一支保证了没有任何新增失败）。与基线打平的
+# no_regression 算过、严格更好的 improved 不算，会让循环为几个与 issue 无关
+# 的环境失败再烧一整轮预算（tenacity#233 实测：多花一倍 token 换来一次回归）。
+_OK_STATUSES = ("fixed", "still_green", "no_regression", "improved")
 
 # 预算闸门分两档 —— 超支的【种类】要和状态的【开销】对得上，一刀切会误伤。
 #   花 token 的状态：任何一种超支都拦。token 用光了还去调模型，

@@ -105,7 +105,9 @@ def compare(base: TestReport, after: TestReport) -> dict:
 
       fixed         基线红、现在绿：目标达成
       still_green   基线绿、现在也绿：没破坏任何东西（改进类任务的通过态）
-      improved      失败数变少但还有红：方向对，继续修
+      improved      基线红的一部分转绿、没有新增失败：也是通过态 ——
+                    它只可能在红基线下出现（绿基线下任何失败都是 regressed），
+                    剩下的红是 no_regression 说的那批环境预置失败的子集
       no_regression 基线就是红的、失败集合没变大：与 still_green 同义 ——
                     那些红是【环境预置】的失败，不是这次改动造成的
       regressed     出现基线里没有的新失败，**或者绿变红**：改出回归了
