@@ -366,6 +366,108 @@ def test_token_limit_still_verifies_but_skips_reviewer(git_repo, tmp_path, monke
     assert res["reviewer"]["decision"] is None
 
 
+def test_empty_diff_is_not_a_success(git_repo, tmp_path, monkeypatch):
+    """agent 一行没改就收工 → 不许判成功。
+
+    真实案例（testify#1785）：executor 空转到放弃、零改动，工作区原样当然
+    still_green、验证当然全过，报告却给了 ok=true 退出码 0 ——
+    "没交卷"被说成"考了满分"。still_green 只有在有补丁的前提下才是成绩。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    green = TestReport(exit_code=0, passed=3, parsed=True)
+    monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: green)
+    monkeypatch.setattr(orchestrator, "run_tests_in", lambda *a, **k: green)
+    monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
+        "status": "still_green", "new_failures": [], "confidence": "high",
+        "baseline": "g", "after": "g"})
+    monkeypatch.setattr(orchestrator, "run_validation",
+                        lambda *a, **k: type("V", (), {"ok": True, "steps": [],
+                                                       "render": lambda self: ""})())
+    monkeypatch.setattr(orchestrator, "run_executor",
+                        lambda *a, **k: ("我放弃了", 0))   # 不写任何文件
+
+    out = tmp_path / "r.json"
+    code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                              budget=Budget(max_fix_attempts=1, allow_reviewer=False),
+                              result_path=str(out))
+
+    assert code == 1
+    res = json.loads(out.read_text())
+    assert res["ok"] is False
+    assert res["halt_code"] == "NO_PATCH"
+    assert res["test_status"] == "still_green"   # 事实照记，但它救不了 ok
+
+
+def test_empty_diff_retries_instead_of_declaring_done(git_repo, tmp_path, monkeypatch):
+    """一轮零改动 + 还有重试额度 → 喂回"零交付"纠偏再来一轮，不许收工。
+
+    sqlfluff#8230 实战：executor 40 轮诊断到一半被截停、零改动，
+    still_green 让循环直接交卷 —— 明明还有两轮额度没用。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    green = TestReport(exit_code=0, passed=3, parsed=True)
+    monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: green)
+    monkeypatch.setattr(orchestrator, "run_tests_in", lambda *a, **k: green)
+    monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
+        "status": "still_green", "new_failures": [], "confidence": "high",
+        "baseline": "g", "after": "g"})
+    monkeypatch.setattr(orchestrator, "run_validation",
+                        lambda *a, **k: type("V", (), {"ok": True, "steps": [],
+                                                       "render": lambda self: ""})())
+
+    rounds = []
+
+    def fake_exec(toolkit, perms, messages, trace, **kw):
+        rounds.append(len(messages))
+        if len(rounds) == 2:                      # 第 1 轮空手而归，第 2 轮交付
+            (git_repo / "a.py").write_text("x = 1\n")
+        return ("done", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
+
+    out = tmp_path / "r.json"
+    code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                              budget=Budget(max_fix_attempts=3, allow_reviewer=False),
+                              result_path=str(out))
+
+    assert len(rounds) == 2, "零交付应触发回炉，而不是 still_green 收工"
+    assert code == 0
+    res = json.loads(out.read_text())
+    assert res["ok"] is True and res["attempts"] == 2
+
+
+def test_test_only_patch_is_not_a_success(git_repo, tmp_path, monkeypatch):
+    """只交付复现测试 = 没修任何东西，不许判成功。
+
+    cobra#1777 重跑实测：一个只含 47 行复现测试的补丁，靠 still_green +
+    "有交付物"拿到了 exit 0。修复必须落在源码上（与官方判分口径一致：
+    测试文件会被还原、拿零分）。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    green = TestReport(exit_code=0, passed=3, parsed=True)
+    monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: green)
+    monkeypatch.setattr(orchestrator, "run_tests_in", lambda *a, **k: green)
+    monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
+        "status": "still_green", "new_failures": [], "confidence": "high",
+        "baseline": "g", "after": "g"})
+
+    def fake_exec(toolkit, perms, messages, trace, **kw):
+        (git_repo / "tests").mkdir(exist_ok=True)
+        (git_repo / "tests" / "test_repro.py").write_text(
+            "def test_repro():\n    assert False\n")
+        return ("写了复现测试", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
+
+    out = tmp_path / "r.json"
+    code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                              budget=Budget(max_fix_attempts=1, allow_reviewer=False),
+                              result_path=str(out))
+
+    assert code == 1
+    res = json.loads(out.read_text())
+    assert res["ok"] is False
+    assert res["halt_code"] == "TEST_ONLY_PATCH"
+
+
 def test_result_json_carries_budget_and_ledger(git_repo, tmp_path, monkeypatch):
     """result.json 是评测线束唯一的判据入口，关键字段必须齐。"""
     _stub_common(monkeypatch, tmp_path)
@@ -378,8 +480,10 @@ def test_result_json_carries_budget_and_ledger(git_repo, tmp_path, monkeypatch):
     monkeypatch.setattr(orchestrator, "run_validation",
                         lambda *a, **k: type("V", (), {"ok": True, "steps": [],
                                                        "render": lambda self: ""})())
-    monkeypatch.setattr(orchestrator, "run_executor",
-                        lambda *a, **k: ("done", 0))
+    def fake_exec(toolkit, perms, messages, trace, **kw):
+        (git_repo / "a.py").write_text("x = 1\n")   # ok=true 要求真的交付了补丁
+        return ("done", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
     monkeypatch.setattr(orchestrator, "review", lambda *a, **k: {
         "decision": "accept", "requested_actions": [], "comments": "ok",
         "unrelated_changes": []})

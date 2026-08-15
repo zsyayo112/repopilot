@@ -86,6 +86,26 @@ _OK_STATUSES = ("fixed", "still_green", "no_regression", "improved")
 _TOKEN_SPENDING_STATES = ("PLAN", "EXECUTE")
 _TIME_ONLY_STATES = ("START_RUNTIME", "REPRODUCE", "VERIFY")
 
+# 一轮结束却零改动时喂回去的纠偏。和 executor 的打转断路器分工：那个打断
+# "还在说车轱辘话"，这个打断"分析得很好但没落成补丁就想收工"。
+_NO_PATCH_FEEDBACK = (
+    "这一轮结束时工作区没有任何代码改动 —— 测试还是绿的，但那是【空洞真】："
+    "没有补丁就没有交付。基于你已经完成的分析，现在就落成最小可验证的修复：\n"
+    "1) 选你当前最可信的根因假设，直接改代码；\n"
+    "2) 补一条修复前会失败、修复后通过的回归测试；\n"
+    "3) run_tests 验证。\n"
+    "不要继续纯分析。假设只有六成把握也动手 —— 改错了测试会告诉你，比零交付强。")
+
+# 交付物里只有测试改动时的纠偏。写出复现测试是【正确的第一步】，要肯定它 ——
+# 但测试本身不修任何东西（cobra#1777 重跑实测：只含复现测试的补丁靠
+# still_green 拿到过 exit 0）。把它当靶子，把修复补上。
+_TEST_ONLY_FEEDBACK = (
+    "你交付的改动只动了测试文件 —— 复现测试是正确的第一步，但它本身不修复 issue。"
+    "现在拿它当靶子：\n"
+    "1) 跑这条复现测试确认它在当前代码上失败（如果它反而通过，说明复现方式不对，先修测试）；\n"
+    "2) 修改【源代码】直到这条测试通过；\n"
+    "3) 再跑全量确认没改坏别处。")
+
 
 def _gate_reason(state: str, ledger: Ledger) -> str | None:
     """这个状态现在还准不准进。返回拦下的原因码，放行返回 None。"""
@@ -374,6 +394,14 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
                     halting, comparison, after_report)
 
             tests_ok = comparison["status"] in _OK_STATUSES
+            # 空 diff 不是完成：什么都没改，测试当然还是绿的（空洞真）。
+            # sqlfluff#8230 实战：executor 40 轮诊断到一半被截停、零改动，
+            # still_green 让循环直接收工交卷 —— 明明还有两轮重试额度没用。
+            # 只动测试文件同理：复现测试不修任何东西，修复必须落在源码上
+            # （分类口径与官方判分一致：测试文件会被还原、拿零分）。
+            diff_now = ws.diff()
+            delivered = bool(diff_now.strip())
+            fix_delivered = delivered and bool(audit_patch(diff_now).source_files)
 
             # 测试绿了不等于没问题：跑一遍 lint/typecheck/build。
             # 只在测试已经绿的时候跑 —— 测试都红着就没必要为构建再等几分钟。
@@ -383,7 +411,7 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
             # 镜像天生带失败测试）里它永远非零，会把一份已达标、Reviewer 也
             # 放行的补丁拖进重试循环直到 ATTEMPTS_EXHAUSTED（容器化冒烟实测,
             # token 花了 5 倍）。绿基线下它也只是把刚跑过的套件再跑一遍。
-            if tests_ok:
+            if tests_ok and fix_delivered:
                 extra_steps = [s.name for s in profile.validation_steps()
                                if s.name != "test"]
                 if extra_steps:
@@ -400,22 +428,29 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
                                 steps=[], note="除 test 外没有可执行的验证步骤")
 
             # 有复现脚本就必须跑同一份，这是"真修好"的唯一客观证据
-            if tests_ok and validation is not None and validation.ok and scenario is not None:
+            if (tests_ok and fix_delivered
+                    and validation is not None and validation.ok and scenario is not None):
                 print(f"{YELLOW}[验证] 重跑同一份复现脚本…{RESET}")
                 repro_after = _run_scenario(scenario, toolkit, run_dir, "after")
                 print(f"{DIM}{repro_after.render()}{RESET}")
                 trace.event("reproduce_after", passed=repro_after.passed)
 
             done = (tests_ok
+                    and fix_delivered
                     and (validation is None or validation.ok)
                     and (scenario is None or (repro_after is not None and repro_after.passed)))
 
             if done:
                 state = "REVIEW"
             elif attempt < budget.max_fix_attempts:
-                messages.append({"role": "user", "content": _retry_feedback(
-                    attempt, comparison, after_report, validation, repro_after,
-                    checkpoint, halting)})
+                if tests_ok and not fix_delivered:
+                    messages.append({"role": "user", "content":
+                                     _NO_PATCH_FEEDBACK if not delivered
+                                     else _TEST_ONLY_FEEDBACK})
+                else:
+                    messages.append({"role": "user", "content": _retry_feedback(
+                        attempt, comparison, after_report, validation, repro_after,
+                        checkpoint, halting)})
                 state = "EXECUTE"
             else:
                 print(f"{RED}[重试额度耗尽] 仍未达标，进入审查阶段如实报告。{RESET}")
@@ -488,12 +523,28 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
 
         elif state == "REPORT":
             aborted = abort_reason is not None
+            # 空 diff 是空洞真：什么都没改的工作区当然 still_green、当然全过
+            # 验证。真实案例（testify#1785）：agent 绕了几十圈一行没改就放弃，
+            # 报告却给了 ok=true、退出码 0 —— 把"没交卷"说成"考了满分"。
+            # still_green 只有在【有补丁】的前提下才是成绩。
+            final_diff = ws.diff()
+            delivered = bool(final_diff.strip())
+            # 修复必须落在源码上：只交测试的补丁官方判分拿零分（测试文件会被
+            # 还原），人类语义下也没修任何东西 —— cobra#1777 重跑实测：只含
+            # 复现测试的补丁靠 still_green 拿到过 exit 0。
+            fix_delivered = delivered and bool(audit_patch(final_diff).source_files)
             ok = (not aborted
+                  and fix_delivered
                   and comparison["status"] in _OK_STATUSES
                   and (validation is None or validation.ok)
                   and (scenario is None or (repro_after is not None and repro_after.passed))
                   and (not budget.allow_reviewer
                        or (verdict is not None and verdict["decision"] == "accept")))
+            if not fix_delivered and not aborted and halt_code in ("", "ATTEMPTS_EXHAUSTED"):
+                # 重试额度耗尽且零交付：NO_PATCH / TEST_ONLY_PATCH 是更诊断性
+                # 的标签。但 TOKEN_LIMIT/TIMEOUT 这类预算死因不覆盖 ——
+                # 那才是真正的止损原因。
+                halt_code = "NO_PATCH" if not delivered else "TEST_ONLY_PATCH"
             exit_code = 0 if ok else 1
             color = GREEN if ok else RED
 
@@ -501,6 +552,10 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
             print(f"{BOLD}RepoPilot 报告{RESET}")
             if aborted:
                 print(f"  {RED}中止：{abort_reason}{RESET}")
+            elif not delivered:
+                print(f"  {RED}未交付任何改动：没有补丁（NO_PATCH）{RESET}")
+            elif not fix_delivered:
+                print(f"  {RED}只交付了测试改动，没有源代码修复（TEST_ONLY_PATCH）{RESET}")
             print(f"  测试对比：{comparison['status']}"
                   f"（可信度 {comparison.get('confidence', '?')}）")
             if validation is not None:
