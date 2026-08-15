@@ -1,9 +1,9 @@
 """Tool Runtime：agent 对目标仓库能做的所有动作。
 
 【工具分组：为什么不是把 28 个工具一次全给它】
-这一版工具从 9 个涨到 28 个。但**默认只暴露 13 个**，剩下的按需开启：
+这一版工具从 9 个涨到 29 个。但**默认只暴露 14 个**，剩下的按需开启：
 
-    core     13 个   永远可用
+    core     14 个   永远可用
     runtime   6 个   --with-runtime 才开（要起真实服务）
     browser   9 个   --with-runtime 且装了 Playwright 才开
 
@@ -58,9 +58,13 @@ class ToolKit:
         self._runtime = None
         self._browser = None
 
+        # 超长输出落盘的序号：句柄要稳定可引用，所以是递增计数不是随机名。
+        self._spill_seq = 0
+
         self._impl = {
             # --- core ---
             "read_file": self.read_file,
+            "read_artifact": self.read_artifact,
             "list_files": self.list_files,
             "search_code": self.search_code,
             "list_symbols": self.list_symbols,
@@ -102,6 +106,49 @@ class ToolKit:
             end = end_line or len(lines)
             text = "\n".join(lines[start:end])
         return text
+
+    def read_artifact(self, handle: str, start_line: int = 0, end_line: int = 0) -> str:
+        """读取被落盘的超长工具输出。句柄来自那次输出末尾的提示。
+
+        【为什么存在】以前超过 MAX_TOOL_OUTPUT 的输出直接截断 —— 丢掉的部分
+        再也拿不回来，模型只能原样重调一次工具、再被截一次。落盘之后，
+        截断丢掉的不再是信息，只是把它搬到了句柄后面，按行段取用。
+        """
+        if self.artifacts_dir is None:
+            return "错误：本次运行没有落盘目录，没有可读的句柄"
+        safe = Path(handle).name                     # 句柄不是路径，防目录穿越
+        path = Path(self.artifacts_dir) / "spill" / f"{safe}.txt"
+        if not path.exists():
+            return f"错误：句柄不存在：{handle}"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        total = len(lines)
+        start = max(start_line - 1, 0)
+        end = min(end_line or start + 150, total)    # 不给范围就从头给一屏
+        text = "\n".join(lines[start:end])
+        if len(text) > MAX_TOOL_OUTPUT - 200:
+            # 防递归落盘：execute() 对本工具豁免 spill，这里自己兜底截断。
+            # 留 200 字符余量，否则这条提示会反被 execute() 的通用截断切掉。
+            return (text[:MAX_TOOL_OUTPUT - 200]
+                    + f"\n\n[范围太宽被截断。共 {total} 行，请缩小 start_line/end_line]")
+        return text + f"\n\n[第 {start + 1}-{end} 行 / 共 {total} 行]"
+
+    def _spill(self, name: str, result: str) -> str:
+        """超长输出：全文落盘，返回头部 + 句柄。"""
+        self._spill_seq += 1
+        handle = f"{self._spill_seq:03d}-{name}"
+        spill_dir = Path(self.artifacts_dir) / "spill"
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        (spill_dir / f"{handle}.txt").write_text(result, encoding="utf-8")
+        total = result.count("\n") + 1
+        head = result[:MAX_TOOL_OUTPUT]
+        cut = head.rfind("\n")
+        if cut > MAX_TOOL_OUTPUT // 2:               # 尽量在行边界截，别切半行
+            head = head[:cut]
+        shown = head.count("\n") + 1
+        return (f"{head}\n\n[输出共 {total} 行 / {len(result):,} 字符，"
+                f"只显示了前 {shown} 行。完整内容已落盘，"
+                f'继续读：read_artifact(handle="{handle}", start_line=…, end_line=…)；'
+                f"或用更窄的参数重新调用 {name}。]")
 
     def list_files(self, directory: str = ".") -> str:
         d = jail(directory, self.root)
@@ -436,8 +483,11 @@ class ToolKit:
             # BrowserUnavailable 这类"环境没装"的错误，消息本身就是安装指引
             return f"错误：{type(e).__name__}: {e}"
         if len(result) > MAX_TOOL_OUTPUT:
-            omitted = len(result) - MAX_TOOL_OUTPUT
-            result = result[:MAX_TOOL_OUTPUT] + f"\n\n[输出被截断，省略了 {omitted} 个字符]"
+            if self.artifacts_dir is not None and name != "read_artifact":
+                result = self._spill(name, result)
+            else:
+                omitted = len(result) - MAX_TOOL_OUTPUT
+                result = result[:MAX_TOOL_OUTPUT] + f"\n\n[输出被截断，省略了 {omitted} 个字符]"
         return result
 
     def cleanup(self) -> str:
@@ -460,8 +510,8 @@ class ToolKit:
 # ---------------------------------------------------------------------------
 SAFE_TOOLS = {
     # 只读
-    "read_file", "list_files", "search_code", "list_symbols", "git_diff",
-    "list_projects", "check_environment", "explore",
+    "read_file", "read_artifact", "list_files", "search_code", "list_symbols",
+    "git_diff", "list_projects", "check_environment", "explore",
     # 跑测试/验证：不改代码，只是执行项目自己的命令
     "run_tests", "run_validation", "run_e2e",
     # 运行时里的只读部分
@@ -504,6 +554,13 @@ CORE_TOOLS = [
          "start_line": {"type": "integer", "description": "起始行号（含，从 1 开始）"},
          "end_line": {"type": "integer", "description": "结束行号（含）"}},
         ["path"]),
+    _fn("read_artifact",
+        "读取之前某次工具调用被落盘的超长输出（句柄写在那次输出末尾的提示里）。"
+        "配合 start_line/end_line 按行段读，别一次全读。",
+        {"handle": {"type": "string", "description": "如 003-run_bash"},
+         "start_line": {"type": "integer", "description": "起始行号（含，从 1 开始）"},
+         "end_line": {"type": "integer", "description": "结束行号（含）"}},
+        ["handle"]),
     _fn("list_files", "列出目录内容，子目录名后带 /。",
         {"directory": {"type": "string"}}, []),
     _fn("search_code",

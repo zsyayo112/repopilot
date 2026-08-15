@@ -91,3 +91,60 @@ def test_jail_does_not_strip_legitimate_same_name_subdir(same_name_repo):
     result = kit.execute("edit_file", {
         "path": "tinydb/queries.py", "old_string": "return 1", "new_string": "return 2"})
     assert "已修改" in result
+
+
+# ---------------------------------------------------------------------------
+# 超长输出落盘 + read_artifact：截断不再销毁信息
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def kit_with_artifacts(repo, tmp_path_factory):
+    art = tmp_path_factory.mktemp("artifacts")
+    return ToolKit(Workspace(repo), artifacts_dir=art), art
+
+
+def test_long_output_spills_to_handle_instead_of_truncating(kit_with_artifacts, repo):
+    """以前超长输出直接截断 —— 丢掉的部分再也拿不回来，模型只能原样重调
+    再被截一次。现在全文落盘，返回头部 + 句柄。"""
+    kit, art = kit_with_artifacts
+    (repo / "big.py").write_text("\n".join(f"line {i}" for i in range(3000)))
+    out = kit.execute("read_file", {"path": "big.py"})
+
+    assert "read_artifact" in out and "001-read_file" in out, "尾巴必须给出句柄和用法"
+    assert out.index("line 0") < out.index("[输出共"), "头部内容要保留"
+    assert (art / "spill" / "001-read_file.txt").read_text().endswith("line 2999")
+
+
+def test_read_artifact_serves_line_ranges(kit_with_artifacts, repo):
+    kit, _ = kit_with_artifacts
+    (repo / "big.py").write_text("\n".join(f"line {i}" for i in range(3000)))
+    kit.execute("read_file", {"path": "big.py"})
+
+    out = kit.execute("read_artifact",
+                      {"handle": "001-read_file", "start_line": 2001, "end_line": 2003})
+    assert "line 2000\nline 2001\nline 2002" in out
+    assert "共 3000 行" in out
+
+
+def test_read_artifact_rejects_traversal_and_unknown_handles(kit_with_artifacts):
+    kit, _ = kit_with_artifacts
+    assert "错误" in kit.execute("read_artifact", {"handle": "../../etc/passwd"})
+    assert "错误" in kit.execute("read_artifact", {"handle": "999-nothing"})
+
+
+def test_read_artifact_caps_overly_wide_ranges_without_respilling(
+        kit_with_artifacts, repo):
+    """防递归：read_artifact 自己的超长结果不能再落盘成新句柄。"""
+    kit, art = kit_with_artifacts
+    (repo / "big.py").write_text("x" * 200 + "\n" + ("y" * 200 + "\n") * 200)
+    kit.execute("read_file", {"path": "big.py"})
+
+    out = kit.execute("read_artifact", {"handle": "001-read_file", "end_line": 200})
+    assert "请缩小 start_line/end_line" in out
+    assert len(list((art / "spill").iterdir())) == 1, "不该产生第二个落盘文件"
+
+
+def test_without_artifacts_dir_falls_back_to_truncation(kit, repo):
+    """单测/detect 场景没有落盘目录：保持老的截断行为，不崩。"""
+    (repo / "big.py").write_text("z" * 20_000)
+    out = kit.execute("read_file", {"path": "big.py"})
+    assert "[输出被截断" in out
