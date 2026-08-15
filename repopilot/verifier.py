@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .adapters.base import TestReport, ValidationStep, tail
 from .config import CMD_TIMEOUT, TEST_TIMEOUT
@@ -65,12 +66,37 @@ def scoped_command(command: str, root, scope: str) -> str:
     """
     tokens = command.split()
     while len(tokens) > 1 and not tokens[-1].startswith("-"):
+        # Go 的包模式（./...、./cmd/...）不是真实存在的路径，但同样是
+        # "范围参数"，必须摘掉 —— 不摘的话 scope 会拼在它后面，go 直接报错
+        # （cobra#1777 实战：`go test -json ./... repro_test.go` →
+        # "named files must all be in one directory"）。
+        if tokens[-1].endswith("/..."):
+            tokens.pop()
+            continue
         candidate = (root / tokens[-1])
         if candidate.exists():
             tokens.pop()
         else:
             break
+    if tokens[:2] == ["go", "test"] or (tokens and tokens[0] == "go" and "test" in tokens):
+        scope = _go_package_scope(scope)
     return " ".join([*tokens, scope])
+
+
+def _go_package_scope(scope: str) -> str:
+    """把 scope 换算成 go test 能接受的包模式。
+
+    go test 不接受裸测试文件（"named files must all be in one directory"，
+    还要求把该包的所有源文件列全）—— 文件要换算成它所在的【包目录】；
+    目录则递归它下面的所有包。
+    """
+    scope = scope.strip().rstrip("/")
+    if scope.endswith(".go"):
+        pkg = str(Path(scope).parent)
+        return "." if pkg == "." else f"./{pkg}"
+    if scope in (".", ""):
+        return "./..."
+    return f"./{scope}/..."
 
 
 def run_tests_in(ws, profile, command: str | None, cwd: str | None = None,

@@ -162,3 +162,24 @@ def test_command_overridden_is_a_property_not_a_string_compare(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
     assert detect(tmp_path).command_overridden is False
     assert detect(tmp_path, test_cmd_override="make test").command_overridden is True
+
+
+# ---------------------------------------------------------------- scoped_command
+def test_scope_replaces_trailing_path_for_pytest(tmp_path):
+    (tmp_path / "tests").mkdir()
+    from repopilot.verifier import scoped_command
+    cmd = scoped_command("python -m pytest -q tests", tmp_path, "tests/test_x.py")
+    assert cmd == "python -m pytest -q tests/test_x.py"
+
+
+def test_go_scope_swaps_package_pattern_not_appends(tmp_path):
+    """cobra#1777 实战翻的车：`go test -json ./... repro_test.go` ——
+    ./... 不是真实路径没被摘掉，go 报 named files must all be in one directory。
+    裸 .go 文件也不能直接给 go test，要换算成它所在的包目录。"""
+    from repopilot.verifier import scoped_command
+    assert scoped_command("go test -json ./...", tmp_path, "repro_test.go") == \
+        "go test -json ."
+    assert scoped_command("go test -json ./...", tmp_path, "doc/x_test.go") == \
+        "go test -json ./doc"
+    assert scoped_command("go test ./...", tmp_path, "doc") == "go test ./doc/..."
+    assert scoped_command("go test -json ./...", tmp_path, ".") == "go test -json ./..."
