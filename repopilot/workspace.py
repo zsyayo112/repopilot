@@ -64,10 +64,29 @@ class Workspace:
         return self._git("rev-parse", "--short", "HEAD")
 
     def diff(self) -> str:
-        return self._git("diff")
+        return self._diff_with_new_files()
 
     def diff_stat(self) -> str:
-        return self._git("diff", "--stat")
+        return self._diff_with_new_files("--stat")
+
+    def _diff_with_new_files(self, *extra: str) -> str:
+        """git diff，但把【新建的未跟踪文件】也算进去。
+
+        裸 `git diff` 对未跟踪文件视而不见 —— agent 用 write_file 新建的
+        测试/模块在检查点、回滚、审计、NO_PATCH 判定眼里统统不存在
+        （cobra#1777 实战：交付物里有个 repro_test.go，diff 却是空的）。
+        做法：对未跟踪文件临时 `git add -N`（intent-to-add，只登记不入库），
+        diff 完立刻 reset 回去 —— 对外表现为一个纯读操作。
+        """
+        untracked = [line for line in self._git(
+            "ls-files", "--others", "--exclude-standard").splitlines() if line.strip()]
+        if untracked:
+            self._git("add", "-N", "--", *untracked)
+        try:
+            return self._git("diff", *extra)
+        finally:
+            if untracked:
+                self._git("reset", "-q", "--", *untracked)
 
     def modified_files(self) -> list[str]:
         lines = self._git("status", "--porcelain").splitlines()
