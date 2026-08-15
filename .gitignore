@@ -2,6 +2,7 @@ __pycache__/
 *.egg-info/
 .env
 runs/
+tmp/
 .venv/
 .pytest_cache/
 *.pyc
