@@ -49,7 +49,10 @@ _SUMMARY_LINE = re.compile(
     re.M | re.I,
 )
 _BARE_SUMMARY = re.compile(
-    r"^(?P<body>(?:\d+ \w+(?:, )?)+|no tests ran)\s+in\s+[\d.]+m?s\s*$",
+    # 结尾允许 pytest 给长跑套件加的人类可读时长，如 `in 300.83s (0:05:00)`。
+    # 少了它，所有跑超过一分钟的套件（也就是一切大型仓库）都解析失败，
+    # Verifier 退化成 exit-code-only —— sqlfluff#8230 实战翻的车。
+    r"^(?P<body>(?:\d+ \w+(?:, )?)+|no tests ran)\s+in\s+[\d.]+m?s(?:\s*\([\d:]+\))?\s*$",
     re.M | re.I,
 )
 

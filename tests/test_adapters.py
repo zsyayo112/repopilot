@@ -23,7 +23,8 @@ def test_go_repo(tmp_path):
     (tmp_path / "go.mod").write_text("module x\n")
     profile = detect(tmp_path)
     assert profile.kind == "go"
-    assert profile.test_cmd == "go test ./..."
+    # -json 让解析从"近似"变成"精确"——失败指纹和细粒度对比全靠它
+    assert profile.test_cmd == "go test -json ./..."
 
 
 def test_maven_repo(tmp_path):

@@ -31,7 +31,12 @@ class GoAdapter(RepoAdapter):
         return None
 
     def test_command(self) -> str | None:
-        return "go test ./..."
+        # -json 让解析从"近似"变成"精确"：每条用例一个事件，失败名单和
+        # 计数都是真的 —— 失败指纹（停机策略）和 improved/no_regression
+        # 这些细粒度判定全靠它。testify#1785 实测：纯文本模式下全绿输出
+        # 没有任何数字可抠，Verifier 退化成 exit-code-only。
+        # 输出量大不是问题：模型侧有落盘句柄，解析侧本来就要全文。
+        return "go test -json ./..."
 
     def parse_test_output(self, output: str, exit_code: int) -> TestReport:
         if report := _parse_go_json(output, exit_code):
@@ -97,6 +102,16 @@ def _parse_go_text(output: str, exit_code: int) -> TestReport:
     names = re.findall(r"^--- FAIL:\s+(\S+)", output, re.M)
     # 编译失败：一个用例都没跑，但 exit != 0。必须能识别，否则看起来像"0 失败"。
     build_failed = bool(re.search(r"^(?:# |.*\[build failed\])", output, re.M))
+    # 全绿的非 -v 输出没有任何 --- PASS 行，只有包级的 `ok  pkg  0.5s`。
+    # 以前这形状 parsed=False，"全绿"和"没看懂"混为一谈（testify#1785 实测）。
+    # 包数不是用例数，但 exit=0 + 全是 ok 行足以断言"0 失败"—— 这正是
+    # 基线对比需要的那个事实。粒度以包计，summary 里如实标注。
+    ok_pkgs = len(re.findall(r"^ok\s+\S+", output, re.M))
+    if not (passed or names or skipped or build_failed) and exit_code == 0 and ok_pkgs:
+        return TestReport(
+            exit_code=exit_code, passed=ok_pkgs, tail=tail(output),
+            parsed=True, framework="go test(pkg)",
+        )
     return TestReport(
         exit_code=exit_code, passed=passed, failed=len(names),
         errors=1 if build_failed else 0, skipped=skipped,

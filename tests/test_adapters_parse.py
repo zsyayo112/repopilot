@@ -302,3 +302,37 @@ def test_minitest_counts(tmp_path):
         "12 runs, 30 assertions, 2 failures, 1 errors, 1 skips\n", 1)
     assert r.framework == "minitest"
     assert (r.passed, r.failed, r.errors, r.skipped) == (8, 2, 1, 1)
+
+
+def test_go_all_green_package_lines_are_parsed(tmp_path):
+    """全绿的非 -v 输出只有包级 ok 行、没有任何 --- PASS。
+
+    以前这形状 parsed=False —— "全绿"和"没看懂"混为一谈，Verifier 退化成
+    exit-code-only（testify#1785 实测）。exit=0 + 全是 ok 行足以断言 0 失败。
+    """
+    out = ("ok  \tgithub.com/x/pkg\t0.031s\n"
+           "?   \tgithub.com/x/cmd\t[no test files]\n"
+           "ok  \tgithub.com/x/other\t(cached)\n")
+    r = GoAdapter(tmp_path).parse_test_output(out, 0)
+    assert r.parsed and r.green
+    assert r.failed == 0 and r.passed == 2
+    assert "pkg" in r.framework
+
+
+def test_go_red_without_fail_lines_stays_unparsed(tmp_path):
+    """exit != 0 但抠不出失败行（比如 panic 形状怪）：仍然只能信 exit_code，
+    不许因为看见几行 ok 就宣称 parsed。"""
+    out = "ok  \tgithub.com/x/pkg\t0.031s\nsome weird crash output\n"
+    r = GoAdapter(tmp_path).parse_test_output(out, 2)
+    assert not r.parsed
+
+
+def test_pytest_long_run_duration_suffix_is_parsed(tmp_path):
+    """pytest 对超过一分钟的套件会在收尾行加人类可读时长：
+    `2341 passed, 101 skipped in 300.83s (0:05:00)`。
+
+    以前这个后缀让 _BARE_SUMMARY 失配 —— 一切大型仓库都退化成
+    exit-code-only（sqlfluff#8230 实战）。"""
+    out = "....\n2341 passed, 101 skipped in 300.83s (0:05:00)\n"
+    r = PythonAdapter(tmp_path).parse_test_output(out, 0)
+    assert r.parsed and r.passed == 2341 and r.skipped == 101
