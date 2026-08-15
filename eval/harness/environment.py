@@ -340,8 +340,10 @@ def _prepare_docker(inst: PublicInstance, env: Env, wd: Path, stamp: Path,
 
     # -- 5. 探测 pytest 参数 + 收集（容器内，环境闸门）--
     ex = DockerExecutor(env.container_name, repo_dir, env.container_python)
-    runner = lambda cmd, timeout=600: _from_exec(ex.run(cmd, cwd=repo_dir,
-                                                        timeout=timeout))
+
+    def runner(cmd, timeout=600):
+        return _from_exec(ex.run(cmd, cwd=repo_dir, timeout=timeout))
+
     code, out = runner(f"{env.container_python} -c "
                        f"'import sys; print(\"%d.%d\" % sys.version_info[:2])'", 120)
     env.python_version = out.strip().splitlines()[-1] if code == 0 and out.strip() else ""

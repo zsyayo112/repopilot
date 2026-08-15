@@ -43,7 +43,13 @@ sys.path.insert(0, str(ROOT))
 from harness import dataset  # noqa: E402
 from harness import manifest as manifest_mod  # noqa: E402
 from harness.environment import (  # noqa: E402
-    Env, ensure_container, env_dir, env_usable, prepare, stop_container)
+    Env,
+    ensure_container,
+    env_dir,
+    env_usable,
+    prepare,
+    stop_container,
+)
 from harness.instances import PublicInstance  # noqa: E402
 
 RUNS_DIR = EVAL_DIR / "runs"
