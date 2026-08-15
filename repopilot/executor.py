@@ -117,6 +117,41 @@ def _stream_once(messages: list, tools: list, budget=None,
     return "".join(content_parts), [tool_buf[i] for i in sorted(tool_buf)], prompt_tokens
 
 
+SPIN_MIN_PARA = 60      # 只统计有实质内容的段落 —— "OK."这类短句天然会重复
+SPIN_REPEATS = 3        # 同一段落第三次出现即判打转
+SPIN_MAX_STRIKES = 2    # 干预两次仍打转就放弃这一轮，别陪它烧完预算
+
+SPIN_FEEDBACK = (
+    "检测到你在逐字重复同一段分析 —— 你在原地打转，继续想只会再重复一遍。"
+    "立刻停止输出分析文字，动手做下面两件事之一：\n"
+    "1) 把 issue 写成一个能运行的复现测试（edit_file 加进对应测试文件），"
+    "然后 run_tests 看它挂在哪里 —— 让事实替你区分假设；\n"
+    "2) 如果几个假设无法靠读代码区分，选可观测量最强的那个直接改代码验证，错了再撤。")
+
+
+def detect_spin(content: str) -> str | None:
+    """检测退化的自我重复输出。打转返回截断后的文本，正常返回 None。
+
+    T=0 下模型有一种典型病理：同一段分析一字不差地重复几十遍（实测
+    testify#1785 一次 completion 里重复了几十遍，8k 输出额度全烧在原地）。
+    停机策略的规则对它全部免疫 —— 不调工具、不改文件、失败指纹不变，
+    它烧的只是 token。所以断路器必须装在 executor 这一层，判据同样只看
+    可观测量：白空格归一后的同一段落第 SPIN_REPEATS 次出现即打转。
+    截断到复发点为止：保留"它开始绕圈"的证据，丢掉后面的空转 ——
+    喂回上下文的重复文本本身就是下一轮继续重复的诱因。
+    """
+    seen: dict[str, int] = {}
+    kept: list[str] = []
+    for para in content.split("\n\n"):
+        key = " ".join(para.split())
+        if len(key) >= SPIN_MIN_PARA:
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] >= SPIN_REPEATS:
+                return "\n\n".join(kept)
+        kept.append(para)
+    return None
+
+
 def _msg_to_dict(content: str, tool_calls: list) -> dict:
     d = {"role": "assistant", "content": content or ""}
     if tool_calls:
@@ -152,6 +187,7 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
     是拿收尾的额度去赌一次定位。剩下的额度应该留给"把已经知道的东西改完"。
     """
     peak_tokens = 0
+    spin_strikes = 0
     tools = toolkit.specs()
     if narrowed:
         tools = [t for t in tools if t["function"]["name"] != "explore"]
@@ -168,6 +204,10 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
 
         content, tool_calls, prompt_tokens = _stream_once(messages, tools, budget, ledger)
         peak_tokens = max(peak_tokens, prompt_tokens)
+
+        truncated = detect_spin(content)
+        if truncated is not None:
+            content = truncated + "\n\n[输出在此被截断：同一段落已第三次逐字重复]"
         messages.append(_msg_to_dict(content, tool_calls))
 
         # 上下文压缩。放在【拿到本轮 prompt_tokens 之后】而不是发请求之前，
@@ -182,6 +222,21 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
                             evicted=evicted, saved_chars=saved)
 
         if not tool_calls:
+            # 打转 + 不调工具：这不是"总结完收工"，是空转到没话可说。
+            # 按正常路径 return 会把这段废话当成最终总结交给 VERIFY ——
+            # testify#1785 就是这么以零改动"完成"的。喂回纠偏指令再给一次
+            # 机会；连续 SPIN_MAX_STRIKES 次仍打转就放弃，如实说明。
+            if truncated is not None:
+                spin_strikes += 1
+                trace.event("executor_spin", strikes=spin_strikes,
+                            peak_tokens=peak_tokens)
+                print(f"\n{YELLOW}[断路器] 检测到重复输出"
+                      f"（第 {spin_strikes}/{SPIN_MAX_STRIKES} 次干预）{RESET}")
+                if spin_strikes >= SPIN_MAX_STRIKES:
+                    return ("（检测到持续的重复输出，两次干预无效，"
+                            "executor 停止 —— 模型无法在此问题上取得进展）"), peak_tokens
+                messages.append({"role": "user", "content": SPIN_FEEDBACK})
+                continue
             trace.event("executor_done", peak_tokens=peak_tokens)
             return content, peak_tokens
 
