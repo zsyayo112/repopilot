@@ -130,7 +130,9 @@ def _gate_reason(state: str, ledger: Ledger) -> str | None:
 
 def solve(repo: str, issue: str, *, test_cmd: str | None = None,
           yes: bool = False, plan_only: bool = False,
-          max_attempts: int | None = None,
+          max_attempts: int | None = None, max_turns: int | None = None,
+          token_budget: int | None = None, instance_timeout: int | None = None,
+          max_output_tokens: int | None = None,
           with_runtime: bool = False, scenario_path: str | None = None,
           ignore_env: bool = False, budget: Budget | None = None,
           result_path: str | None = None, executor=None) -> int:
@@ -145,6 +147,17 @@ def solve(repo: str, issue: str, *, test_cmd: str | None = None,
                               max_fix_attempts=MAX_FIX_ATTEMPTS)
     if max_attempts is not None:
         budget = budget.variant(max_fix_attempts=max_attempts)
+    # 推理模型（R1 等）每圈更实在但也更慢更贵：40 圈够 chat 打三个来回，
+    # 却不够 R1 做完"复现 + 定位 + 修复"一整套。这三个上限因此要可调 ——
+    # cobra#1777 的 R1 实测：复现正确、方向正确，死于圈数和 token 双上限。
+    if max_turns is not None:
+        budget = budget.variant(max_turns=max_turns)
+    if token_budget is not None:
+        budget = budget.variant(token_budget=token_budget)
+    if instance_timeout is not None:
+        budget = budget.variant(instance_timeout=instance_timeout)
+    if max_output_tokens is not None:
+        budget = budget.variant(max_output_tokens=max_output_tokens)
     if with_runtime:
         budget = budget.variant(allow_runtime=True)
     ledger = Ledger(budget=budget)

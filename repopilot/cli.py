@@ -42,6 +42,16 @@ def main() -> None:
                          help="只出计划不动手（便宜地检查 Planner 质量）")
     p_solve.add_argument("--max-attempts", type=int, default=None,
                          help="测试失败后的最大重试轮数")
+    p_solve.add_argument("--max-turns", type=int, default=None,
+                         help="executor 每轮的最大对话圈数（默认 40；推理模型每圈更实"
+                              "在但更慢，深题建议 80）")
+    p_solve.add_argument("--token-budget", type=int, default=None,
+                         help="整场 token 上限（默认 600000）")
+    p_solve.add_argument("--instance-timeout", type=int, default=None,
+                         help="整场墙钟上限秒数（默认 1800）")
+    p_solve.add_argument("--max-output-tokens", type=int, default=None,
+                         help="单次模型回复的输出上限（默认 8192）。推理模型的思考也"
+                              "计入其中，深题烧穿后回复为空 —— R1 类模型建议 32768")
     p_solve.add_argument("--with-runtime", action="store_true",
                          help="开启运行时验证：启动应用 + 浏览器工具（处理必须渲染才能发现的问题）")
     p_solve.add_argument("--scenario",
@@ -104,6 +114,9 @@ def main() -> None:
             args.repo, issue,
             test_cmd=args.test_cmd, yes=args.yes, plan_only=args.plan_only,
             max_attempts=args.max_attempts or MAX_FIX_ATTEMPTS,
+            max_turns=args.max_turns, token_budget=args.token_budget,
+            instance_timeout=args.instance_timeout,
+            max_output_tokens=args.max_output_tokens,
             with_runtime=args.with_runtime, scenario_path=args.scenario,
             ignore_env=args.ignore_env, budget=budget,
         )
