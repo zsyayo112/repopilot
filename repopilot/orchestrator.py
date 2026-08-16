@@ -106,6 +106,15 @@ _TEST_ONLY_FEEDBACK = (
     "2) 修改【源代码】直到这条测试通过；\n"
     "3) 再跑全量确认没改坏别处。")
 
+# 只动了测试文件 + 出现新失败：那是它自己写的复现测试在红 —— 预期中的红，
+# 不是回归。上一版会走 _retry_feedback 的"新增失败是你改出来的回归"分支，
+# 对着一条故意写红的复现测试喊回滚（R1 在 cobra#1777 实测被这句话带偏）。
+_REPRO_READY_FEEDBACK = (
+    "验证结果：你目前只改了测试文件，新增的失败正是你自己写的复现测试 —— "
+    "这是【预期中的红】，不是回归，复现已经就位，这一步做得对。\n"
+    "现在完成另一半：修改【源代码】让这条复现测试转绿，同时保持其余测试全绿。"
+    "不要回滚复现测试，也不要为了变绿去改测试的断言（除非你发现复现方式本身错了）。")
+
 
 def _gate_reason(state: str, ledger: Ledger) -> str | None:
     """这个状态现在还准不准进。返回拦下的原因码，放行返回 None。"""
@@ -443,7 +452,9 @@ def _loop(ws, profile, issue, toolkit, perms, trace, run_dir, *,
             if done:
                 state = "REVIEW"
             elif attempt < budget.max_fix_attempts:
-                if tests_ok and not fix_delivered:
+                if delivered and not fix_delivered and comparison.get("new_failures"):
+                    messages.append({"role": "user", "content": _REPRO_READY_FEEDBACK})
+                elif tests_ok and not fix_delivered:
                     messages.append({"role": "user", "content":
                                      _NO_PATCH_FEEDBACK if not delivered
                                      else _TEST_ONLY_FEEDBACK})

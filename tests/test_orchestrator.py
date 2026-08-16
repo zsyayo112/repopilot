@@ -468,6 +468,55 @@ def test_test_only_patch_is_not_a_success(git_repo, tmp_path, monkeypatch):
     assert res["halt_code"] == "TEST_ONLY_PATCH"
 
 
+def test_red_repro_test_gets_repro_feedback_not_regression_blame(
+        git_repo, tmp_path, monkeypatch):
+    """只动了测试 + 新增失败 = 自己写的复现在红：预期中的红，不是回归。
+
+    R1 在 cobra#1777 实测：正确的红复现被 _retry_feedback 判成"你改出了回归、
+    优先处理"，第 2 轮被带偏。正确的反馈是"复现就位，修源码让它转绿"。
+    """
+    _stub_common(monkeypatch, tmp_path)
+    seq = [TestReport(exit_code=0, passed=3, parsed=True),                 # 基线
+           TestReport(exit_code=1, passed=3, failed=1, parsed=True,
+                      failed_names=["tests/test_repro.py::test_repro"]),   # 复现红
+           TestReport(exit_code=0, passed=4, parsed=True)]                 # 修复后
+    calls = {"n": 0}
+    monkeypatch.setattr(orchestrator, "run_tests", lambda *a, **k: seq[0])
+    monkeypatch.setattr(orchestrator, "run_tests_in",
+                        lambda *a, **k: seq[min(calls["n"], 2)])
+    monkeypatch.setattr(orchestrator, "compare", lambda b, a: {
+        "status": "regressed" if a.failed else "still_green",
+        "new_failures": list(a.failed_names), "confidence": "high",
+        "baseline": "g", "after": f"{a.failed} failed"})
+    monkeypatch.setattr(orchestrator, "run_validation",
+                        lambda *a, **k: type("V", (), {"ok": True, "steps": [],
+                                                       "render": lambda self: ""})())
+
+    feedbacks = []
+
+    def fake_exec(toolkit, perms, messages, trace, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            (git_repo / "tests").mkdir(exist_ok=True)
+            (git_repo / "tests" / "test_repro.py").write_text(
+                "def test_repro():\n    assert False\n")
+        else:
+            feedbacks.append(messages[-1]["content"])
+            (git_repo / "a.py").write_text("x = 1\n")          # 补上源码修复
+        return ("done", 0)
+    monkeypatch.setattr(orchestrator, "run_executor", fake_exec)
+
+    out = tmp_path / "r.json"
+    code = orchestrator.solve(str(git_repo), "issue", test_cmd="echo", yes=True,
+                              budget=Budget(max_fix_attempts=3, allow_reviewer=False),
+                              result_path=str(out))
+
+    assert code == 0
+    assert feedbacks and "预期中的红" in feedbacks[0], \
+        "红复现应得到'复现就位'反馈，而不是被当成回归指责"
+    assert "你改出来的回归" not in feedbacks[0]
+
+
 def test_result_json_carries_budget_and_ledger(git_repo, tmp_path, monkeypatch):
     """result.json 是评测线束唯一的判据入口，关键字段必须齐。"""
     _stub_common(monkeypatch, tmp_path)
