@@ -83,6 +83,7 @@ def _stream_once(messages: list, tools: list, budget=None,
     content_parts: list[str] = []
     tool_buf: dict[int, dict] = {}
     prompt_tokens = 0
+    reasoning_chars = 0
     printed_header = False
 
     for chunk in stream:
@@ -93,6 +94,13 @@ def _stream_once(messages: list, tools: list, budget=None,
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
+
+        # 推理模型（deepseek-reasoner 等）的思考流走 reasoning_content 字段。
+        # 不收集进上下文（那是它的草稿），但要计量并让人看见 —— R1 实测：
+        # 思考把 max_tokens 烧穿后 content 为空，外面看就是"一声不吭地结束"。
+        rc = getattr(delta, "reasoning_content", None)
+        if rc:
+            reasoning_chars += len(rc)
 
         if delta.content:
             if not printed_header:
@@ -114,12 +122,19 @@ def _stream_once(messages: list, tools: list, budget=None,
 
     if printed_header:
         print()
+    if reasoning_chars:
+        print(f"{DIM}[思考 {reasoning_chars:,} 字符]{RESET}")
     return "".join(content_parts), [tool_buf[i] for i in sorted(tool_buf)], prompt_tokens
 
 
 SPIN_MIN_PARA = 60      # 只统计有实质内容的段落 —— "OK."这类短句天然会重复
 SPIN_REPEATS = 3        # 同一段落第三次出现即判打转
 SPIN_MAX_STRIKES = 2    # 干预两次仍打转就放弃这一轮，别陪它烧完预算
+
+EMPTY_FEEDBACK = (
+    "你上一条回复是空的 —— 很可能是思考长度超出了输出上限，结论没能写出来。"
+    "不要重新展开长篇分析：基于你已经想清楚的部分，直接给出下一步的【工具调用】"
+    "（读代码 / 改代码 / 跑测试），把结论落成动作。")
 
 SPIN_FEEDBACK = (
     "检测到你在逐字重复同一段分析 —— 你在原地打转，继续想只会再重复一遍。"
@@ -187,7 +202,7 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
     是拿收尾的额度去赌一次定位。剩下的额度应该留给"把已经知道的东西改完"。
     """
     peak_tokens = 0
-    spin_strikes = 0
+    spin_strikes = empty_strikes = 0
     tools = toolkit.specs()
     if narrowed:
         tools = [t for t in tools if t["function"]["name"] != "explore"]
@@ -222,6 +237,20 @@ def run_executor(toolkit: ToolKit, perms: Permissions, messages: list,
                             evicted=evicted, saved_chars=saved)
 
         if not tool_calls:
+            # 空回复 + 不调工具：不是"没什么可说的"，是回复被截没了。
+            # R1 实测（cobra#1777）：思考流烧穿 max_tokens，content 一个字都没有，
+            # 旧逻辑把它当成最终总结收工 —— 两轮都"安静地"零交付结束。
+            if not content.strip():
+                empty_strikes += 1
+                trace.event("executor_empty_completion", strikes=empty_strikes,
+                            peak_tokens=peak_tokens)
+                print(f"\n{YELLOW}[空回复] 疑似思考超出输出上限"
+                      f"（第 {empty_strikes}/2 次干预）{RESET}")
+                if empty_strikes >= 2:
+                    return ("（连续两次空回复，疑似输出上限过小 —— "
+                            "考虑用 --max-output-tokens 加大后重跑）"), peak_tokens
+                messages.append({"role": "user", "content": EMPTY_FEEDBACK})
+                continue
             # 打转 + 不调工具：这不是"总结完收工"，是空转到没话可说。
             # 按正常路径 return 会把这段废话当成最终总结交给 VERIFY ——
             # testify#1785 就是这么以零改动"完成"的。喂回纠偏指令再给一次

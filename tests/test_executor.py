@@ -77,3 +77,20 @@ def test_persistent_spin_gives_up_after_two_strikes(monkeypatch, tmp_path):
     spin = "\n\n".join([PARA] * 5)
     summary, _ = _run(monkeypatch, tmp_path, [spin, spin, "不该走到第三次"])
     assert "重复输出" in summary and "停止" in summary
+
+
+def test_empty_completion_gets_nudged_not_accepted(monkeypatch, tmp_path):
+    """空回复 + 不调工具 ≠ 总结完收工 —— 那是回复被截没了。
+
+    R1 实测（cobra#1777）：思考流把 max_tokens 烧穿，content 一个字没有，
+    旧逻辑把它当最终总结，两轮都"安静地"零交付结束。
+    """
+    summary, messages = _run(monkeypatch, tmp_path, ["", "改完了。"])
+    assert summary == "改完了。"
+    assert any(m["role"] == "user" and "输出上限" in m["content"]
+               for m in messages), "必须注入'把结论落成动作'的纠偏"
+
+
+def test_two_empty_completions_give_up_with_actionable_advice(monkeypatch, tmp_path):
+    summary, _ = _run(monkeypatch, tmp_path, ["", "", "不该到这"])
+    assert "--max-output-tokens" in summary, "放弃时要告诉人怎么修（加大输出上限）"
